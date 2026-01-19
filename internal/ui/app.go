@@ -83,6 +83,31 @@ func NewApp(in io.Reader, out io.Writer) *App {
 	return &App{in: in, out: out, scr: screenBaseURL}
 }
 
+// singleLineEditor is an editor that doesn't consume Enter (lets keybinding handle it)
+type singleLineEditor struct{}
+
+func (e singleLineEditor) Edit(v *gocui.View, key gocui.Key, ch rune, mod gocui.Modifier) {
+	switch {
+	case key == gocui.KeyBackspace || key == gocui.KeyBackspace2:
+		v.EditDelete(true)
+	case key == gocui.KeyDelete:
+		v.EditDelete(false)
+	case key == gocui.KeyArrowLeft:
+		v.MoveCursor(-1, 0, false)
+	case key == gocui.KeyArrowRight:
+		v.MoveCursor(1, 0, false)
+	case key == gocui.KeyHome || key == gocui.KeyCtrlA:
+		v.SetCursor(0, 0)
+	case key == gocui.KeyEnd || key == gocui.KeyCtrlE:
+		line := v.Buffer()
+		v.SetCursor(len(line)-1, 0)
+	case key == gocui.KeyEnter:
+		// don't handle - let keybinding process it
+	case ch != 0 && mod == 0:
+		v.EditWrite(ch)
+	}
+}
+
 func (a *App) Run() error {
 	g, err := gocui.NewGui(gocui.OutputNormal)
 	if err != nil {
@@ -92,7 +117,7 @@ func (a *App) Run() error {
 	a.g = g
 
 	g.Cursor = true
-	g.InputEsc = false // disable esc processing to avoid conflicts
+	g.InputEsc = true
 	g.SetManagerFunc(a.layout)
 
 	if err := a.bindKeys(); err != nil {
@@ -107,7 +132,6 @@ func (a *App) Run() error {
 
 func (a *App) layout(g *gocui.Gui) error {
 	maxX, maxY := g.Size()
-	debugLog.Printf("layout called: screen=%d, size=%dx%d", a.scr, maxX, maxY)
 
 	if v, err := g.SetView("header", 0, 0, maxX-1, 2); err != nil {
 		if err != gocui.ErrUnknownView {
@@ -186,43 +210,131 @@ func (a *App) layoutEndpoints(maxX, maxY int) error {
 }
 
 func (a *App) layoutBuilder(maxX, maxY int) error {
-	a.clearMainViews([]string{"path", "query", "body"})
+	// determine which panels to show
+	hasPath := len(a.activeEndpoint.PathParams) > 0
+	hasQuery := len(a.activeEndpoint.QueryParams) > 0
+	hasBody := a.activeEndpoint.Body != nil
 
-	midX := maxX / 2
+	// build list of panels to display
+	var panels []string
+	if hasPath {
+		panels = append(panels, "path")
+	}
+	if hasQuery {
+		panels = append(panels, "query")
+	}
+	if hasBody {
+		panels = append(panels, "body")
+	}
+
+	// fallback: show at least path panel with "(none)" message
+	if len(panels) == 0 {
+		panels = []string{"path"}
+		hasPath = true
+	}
+
+	// clear views that won't be shown, but keep edit modal if active
+	keepViews := make([]string, len(panels))
+	copy(keepViews, panels)
+	if a.editing {
+		keepViews = append(keepViews, "edit")
+	}
+	a.clearMainViews(keepViews)
+
+	// ensure current pane is valid
+	a.ensureValidPane(hasPath, hasQuery, hasBody)
+
 	bodyTop := 2
 	paramsBottom := maxY - 3
+	panelHeight := (paramsBottom - bodyTop) / len(panels)
 
-	if v, err := a.g.SetView("path", 0, bodyTop, midX-1, (bodyTop+paramsBottom)/2); err != nil {
-		if err != gocui.ErrUnknownView {
-			return err
+	for i, panel := range panels {
+		y0 := bodyTop + i*panelHeight
+		y1 := bodyTop + (i+1)*panelHeight
+		if i == len(panels)-1 {
+			y1 = paramsBottom
 		}
-		v.Title = "Path Params"
-		v.Highlight = true
-		v.SelFgColor = gocui.ColorBlack
-		v.SelBgColor = gocui.ColorGreen
-	}
-	if v, err := a.g.SetView("query", 0, (bodyTop+paramsBottom)/2, midX-1, paramsBottom); err != nil {
-		if err != gocui.ErrUnknownView {
-			return err
+
+		if v, err := a.g.SetView(panel, 0, y0, maxX-1, y1); err != nil {
+			if err != gocui.ErrUnknownView {
+				return err
+			}
+			v.Highlight = true
 		}
-		v.Title = "Query Params"
-		v.Highlight = true
-		v.SelFgColor = gocui.ColorBlack
-		v.SelBgColor = gocui.ColorGreen
-	}
-	if v, err := a.g.SetView("body", midX, bodyTop, maxX-1, paramsBottom); err != nil {
-		if err != gocui.ErrUnknownView {
-			return err
-		}
-		v.Title = "Body"
-		v.Highlight = true
-		v.SelFgColor = gocui.ColorBlack
-		v.SelBgColor = gocui.ColorGreen
 	}
 
 	a.renderBuilder()
-	a.setBuilderFocus()
+	a.updatePanelColors()
+
+	// if editing, ensure edit view is on top and focused
+	if a.editing {
+		if v, err := a.g.View("edit"); err == nil {
+			a.g.SetViewOnTop("edit")
+			a.g.SetCurrentView("edit")
+			_ = v // avoid unused warning
+		}
+	} else {
+		a.setBuilderFocus()
+	}
 	return nil
+}
+
+func (a *App) ensureValidPane(hasPath, hasQuery, hasBody bool) {
+	// if current pane doesn't exist, switch to first valid one
+	switch a.pane {
+	case panePath:
+		if !hasPath {
+			if hasQuery {
+				a.pane = paneQuery
+			} else if hasBody {
+				a.pane = paneBody
+			}
+		}
+	case paneQuery:
+		if !hasQuery {
+			if hasPath {
+				a.pane = panePath
+			} else if hasBody {
+				a.pane = paneBody
+			}
+		}
+	case paneBody:
+		if !hasBody {
+			if hasPath {
+				a.pane = panePath
+			} else if hasQuery {
+				a.pane = paneQuery
+			}
+		}
+	}
+}
+
+func (a *App) updatePanelColors() {
+	// set colors: focused pane gets green highlight, others get muted
+	panels := []struct {
+		name string
+		pane focusPane
+	}{
+		{"path", panePath},
+		{"query", paneQuery},
+		{"body", paneBody},
+	}
+
+	for _, p := range panels {
+		v, err := a.g.View(p.name)
+		if err != nil {
+			continue
+		}
+		if a.pane == p.pane && !a.editing {
+			v.SelBgColor = gocui.ColorGreen
+			v.SelFgColor = gocui.ColorBlack
+			v.FgColor = gocui.ColorWhite
+		} else {
+			v.SelBgColor = gocui.ColorDefault
+			v.SelFgColor = gocui.ColorDefault
+			v.FgColor = gocui.ColorDefault
+		}
+	}
 }
 
 func (a *App) layoutResponse(maxX, maxY int) error {
@@ -387,30 +499,25 @@ func (a *App) back(*gocui.Gui, *gocui.View) error {
 }
 
 func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
-	debugLog.Printf("submitBaseURL called with baseURL=%q", a.baseURL)
 	raw := strings.TrimSpace(a.baseURL)
 	if raw == "" {
 		a.errorMsg = "base URL required"
-		debugLog.Printf("submitBaseURL: empty URL")
 		return nil
 	}
 	norm := normalizeBaseURL(raw)
 	if _, err := url.ParseRequestURI(norm); err != nil {
 		a.errorMsg = "invalid base URL"
-		debugLog.Printf("submitBaseURL: invalid URL %q", norm)
 		return nil
 	}
 
 	a.baseURL = norm
 	a.errorMsg = "loading openapi..."
-	debugLog.Printf("submitBaseURL: loading from %q", a.baseURL)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	doc, err := openapi.Load(ctx, a.baseURL)
 	if err != nil {
 		a.errorMsg = err.Error()
-		debugLog.Printf("submitBaseURL: load error: %v", err)
 		return nil
 	}
 	endpoints := openapi.ExtractEndpoints(doc)
@@ -419,7 +526,6 @@ func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
 	a.selected = 0
 	a.recomputeFilter()
 
-	debugLog.Printf("submitBaseURL: loaded %d endpoints, transitioning to endpoints screen", len(endpoints))
 	a.scr = screenEndpoints
 	a.errorMsg = ""
 	return nil
@@ -518,19 +624,47 @@ func (a *App) tabPane(*gocui.Gui, *gocui.View) error {
 	if a.scr != screenBuilder || a.editing {
 		return nil
 	}
-	if a.pane == panePath {
-		a.pane = paneQuery
-	} else if a.pane == paneQuery {
-		a.pane = paneBody
-	} else {
-		a.pane = panePath
+
+	// get available panes
+	hasPath := len(a.activeEndpoint.PathParams) > 0
+	hasQuery := len(a.activeEndpoint.QueryParams) > 0
+	hasBody := a.activeEndpoint.Body != nil
+
+	// cycle to next available pane
+	for i := 0; i < 3; i++ {
+		switch a.pane {
+		case panePath:
+			a.pane = paneQuery
+		case paneQuery:
+			a.pane = paneBody
+		case paneBody:
+			a.pane = panePath
+		}
+
+		// check if new pane is valid
+		switch a.pane {
+		case panePath:
+			if hasPath {
+				goto done
+			}
+		case paneQuery:
+			if hasQuery {
+				goto done
+			}
+		case paneBody:
+			if hasBody {
+				goto done
+			}
+		}
 	}
+done:
+	a.updatePanelColors()
 	a.setBuilderFocus()
 	return nil
 }
 
 func (a *App) setBuilderFocus() {
-	if a.scr != screenBuilder {
+	if a.scr != screenBuilder || a.editing {
 		return
 	}
 	name := "path"
@@ -542,7 +676,7 @@ func (a *App) setBuilderFocus() {
 	case paneBody:
 		name = "body"
 	}
-	_, _ = a.g.SetCurrentView(name)
+	a.g.SetCurrentView(name)
 }
 
 func (a *App) moveRow(viewName string, delta int) func(*gocui.Gui, *gocui.View) error {
@@ -590,20 +724,36 @@ func (a *App) beginEdit(viewName string) func(*gocui.Gui, *gocui.View) error {
 		a.editing = true
 		a.editTarget = viewName + ":" + key
 
+		// centered modal dialog
 		maxX, maxY := g.Size()
-		x0, y0 := maxX/6, maxY/3
-		x1, y1 := maxX*5/6, maxY/3+4
+		width := 60
+		if width > maxX-4 {
+			width = maxX - 4
+		}
+		height := 3
+		x0 := (maxX - width) / 2
+		y0 := (maxY - height) / 2
+		x1 := x0 + width
+		y1 := y0 + height
+
 		if ev, err := g.SetView("edit", x0, y0, x1, y1); err != nil {
 			if err != gocui.ErrUnknownView {
 				return err
 			}
-			ev.Title = "Edit"
+			ev.Title = fmt.Sprintf(" %s (enter=ok, esc=cancel) ", key)
 			ev.Editable = true
-			ev.Editor = gocui.DefaultEditor
-			ev.Clear()
-			fmt.Fprint(ev, a.currentValueFor(key, viewName))
-			_, _ = g.SetCurrentView("edit")
+			ev.Editor = singleLineEditor{}
+			ev.BgColor = gocui.ColorBlack
+			ev.FgColor = gocui.ColorWhite
 		}
+		// always update content and focus (in case view already existed)
+		if ev, err := g.View("edit"); err == nil {
+			ev.Clear()
+			currentVal := a.currentValueFor(key, viewName)
+			fmt.Fprint(ev, currentVal)
+			ev.SetCursor(len(currentVal), 0)
+		}
+		g.SetCurrentView("edit")
 		return nil
 	}
 }
@@ -816,6 +966,7 @@ func (a *App) renderBuilder() {
 	a.renderFooter()
 
 	if v, err := a.g.View("path"); err == nil {
+		v.Title = "Path Params"
 		v.Clear()
 		for _, p := range a.activeEndpoint.PathParams {
 			val := a.pathVals[p.Name]
@@ -831,6 +982,7 @@ func (a *App) renderBuilder() {
 	}
 
 	if v, err := a.g.View("query"); err == nil {
+		v.Title = "Query Params"
 		v.Clear()
 		for _, p := range a.activeEndpoint.QueryParams {
 			val := a.queryVals[p.Name]
@@ -846,6 +998,7 @@ func (a *App) renderBuilder() {
 	}
 
 	if v, err := a.g.View("body"); err == nil {
+		v.Title = "Body"
 		v.Clear()
 		if a.activeEndpoint.Body == nil {
 			fmt.Fprintln(v, "(no body)")
