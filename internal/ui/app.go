@@ -116,11 +116,17 @@ func (a *App) Run() error {
 	defer g.Close()
 	a.g = g
 
-	// check env for base url
+	// check env for base url - skip prompt if set
 	if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
 		a.baseURL = envURL
 		if !strings.HasPrefix(a.baseURL, "http://") && !strings.HasPrefix(a.baseURL, "https://") {
 			a.baseURL = "http://" + a.baseURL
+		}
+		// load endpoints immediately
+		if err := a.loadEndpoints(); err != nil {
+			a.errorMsg = "error: " + err.Error()
+		} else {
+			a.scr = screenEndpoints
 		}
 	}
 
@@ -407,6 +413,12 @@ func (a *App) bindKeys() error {
 	if err := g.SetKeybinding("endpoints", gocui.KeyBackspace2, gocui.ModNone, a.filterBackspace); err != nil {
 		return err
 	}
+	// number shortcuts 1-5 for quick endpoint selection
+	for i := 1; i <= 5; i++ {
+		if err := g.SetKeybinding("endpoints", rune('0'+i), gocui.ModNone, a.selectEndpointByNumber(i)); err != nil {
+			return err
+		}
+	}
 
 	// builder
 	if err := g.SetKeybinding("", gocui.KeyTab, gocui.ModNone, a.tabPane); err != nil {
@@ -456,6 +468,9 @@ func (a *App) bindKeys() error {
 		return err
 	}
 	if err := g.SetKeybinding("response", 'r', gocui.ModNone, a.rerun); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("response", gocui.KeyEnter, gocui.ModNone, a.responseToEndpoints); err != nil {
 		return err
 	}
 
@@ -521,21 +536,27 @@ func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
 	a.baseURL = norm
 	a.errorMsg = "loading openapi..."
 
+	if err := a.loadEndpoints(); err != nil {
+		a.errorMsg = err.Error()
+		return nil
+	}
+
+	a.scr = screenEndpoints
+	a.errorMsg = ""
+	return nil
+}
+
+func (a *App) loadEndpoints() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	doc, err := openapi.Load(ctx, a.baseURL)
 	if err != nil {
-		a.errorMsg = err.Error()
-		return nil
+		return err
 	}
-	endpoints := openapi.ExtractEndpoints(doc)
-	a.endpoints = endpoints
+	a.endpoints = openapi.ExtractEndpoints(doc)
 	a.filter = ""
 	a.selected = 0
 	a.recomputeFilter()
-
-	a.scr = screenEndpoints
-	a.errorMsg = ""
 	return nil
 }
 
@@ -624,6 +645,29 @@ func (a *App) openBuilder(*gocui.Gui, *gocui.View) error {
 	a.bodyVals = map[string]string{}
 	a.pane = panePath
 	a.scr = screenBuilder
+	a.errorMsg = ""
+	return nil
+}
+
+func (a *App) selectEndpointByNumber(num int) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		if a.scr != screenEndpoints {
+			return nil
+		}
+		idx := num - 1 // convert 1-based to 0-based
+		if idx < 0 || idx >= len(a.filtered) {
+			return nil
+		}
+		a.selected = idx
+		return a.openBuilder(g, v)
+	}
+}
+
+func (a *App) responseToEndpoints(*gocui.Gui, *gocui.View) error {
+	if a.scr != screenResponse {
+		return nil
+	}
+	a.scr = screenEndpoints
 	a.errorMsg = ""
 	return nil
 }
@@ -875,11 +919,11 @@ func (a *App) renderFooter() {
 			case screenBaseURL:
 				msg = "enter: load openapi   q: quit"
 			case screenEndpoints:
-				msg = "type: filter   enter: select   esc: back   q: quit"
+				msg = "type: filter   1-5: quick select   enter: select   esc: back   q: quit"
 			case screenBuilder:
 				msg = "tab: switch pane   enter: edit   ctrl+r: run   esc: back"
 			case screenResponse:
-				msg = "up/down: scroll   r: rerun   esc: back"
+				msg = "up/down: scroll   r: rerun   enter: back to endpoints   esc: back"
 			}
 		}
 		fmt.Fprint(v, msg)
@@ -961,13 +1005,18 @@ func (a *App) renderEndpoints() {
 	}
 	v.Clear()
 
-	for _, idx := range a.filtered {
+	for i, idx := range a.filtered {
 		ep := a.endpoints[idx]
 		label := firstNonEmpty(ep.Summary, ep.OperationID)
 		if label != "" {
 			label = " - " + label
 		}
-		fmt.Fprintf(v, "%s  %s%s\n", padRight(ep.Method, 6), ep.Path, label)
+		// show number prefix for top 5 results
+		prefix := "  "
+		if i < 5 {
+			prefix = fmt.Sprintf("%d ", i+1)
+		}
+		fmt.Fprintf(v, "%s%s  %s%s\n", prefix, padRight(ep.Method, 6), ep.Path, label)
 	}
 	v.SetCursor(0, a.selected)
 }
