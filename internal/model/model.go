@@ -21,12 +21,14 @@ type Param struct {
 	Required    bool
 	Type        ParamType
 	Description string
+	Example     string
 }
 
 type BodyField struct {
 	Name     string
 	Required bool
 	Type     ParamType
+	Example  string
 }
 
 type BodySchema struct {

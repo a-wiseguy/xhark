@@ -213,12 +213,83 @@ func formatBody(contentType string, body []byte) string {
 	if strings.Contains(ct, "application/json") {
 		var v any
 		if err := json.Unmarshal(body, &v); err == nil {
-			pretty, err := json.MarshalIndent(v, "", "  ")
-			if err == nil {
-				return string(pretty)
-			}
+			return colorizeJSON(v, 0)
 		}
 	}
-	// Best-effort as text.
 	return string(body)
+}
+
+// ansi color codes
+const (
+	colorReset   = "\033[0m"
+	colorKey     = "\033[36m"  // cyan for keys
+	colorString  = "\033[32m"  // green for strings
+	colorNumber  = "\033[33m"  // yellow for numbers
+	colorBool    = "\033[35m"  // magenta for booleans
+	colorNull    = "\033[90m"  // gray for null
+	colorBracket = "\033[37m"  // white for brackets
+)
+
+func colorizeJSON(v any, indent int) string {
+	prefix := strings.Repeat("  ", indent)
+
+	switch val := v.(type) {
+	case nil:
+		return colorNull + "null" + colorReset
+	case bool:
+		return colorBool + fmt.Sprintf("%v", val) + colorReset
+	case float64:
+		if val == float64(int64(val)) {
+			return colorNumber + fmt.Sprintf("%.0f", val) + colorReset
+		}
+		return colorNumber + fmt.Sprintf("%v", val) + colorReset
+	case string:
+		return colorString + `"` + escapeJSON(val) + `"` + colorReset
+	case []any:
+		if len(val) == 0 {
+			return colorBracket + "[]" + colorReset
+		}
+		var sb strings.Builder
+		sb.WriteString(colorBracket + "[" + colorReset + "\n")
+		for i, item := range val {
+			sb.WriteString(prefix + "  " + colorizeJSON(item, indent+1))
+			if i < len(val)-1 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(prefix + colorBracket + "]" + colorReset)
+		return sb.String()
+	case map[string]any:
+		if len(val) == 0 {
+			return colorBracket + "{}" + colorReset
+		}
+		var sb strings.Builder
+		sb.WriteString(colorBracket + "{" + colorReset + "\n")
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		for i, k := range keys {
+			sb.WriteString(prefix + "  " + colorKey + `"` + k + `"` + colorReset + ": ")
+			sb.WriteString(colorizeJSON(val[k], indent+1))
+			if i < len(keys)-1 {
+				sb.WriteString(",")
+			}
+			sb.WriteString("\n")
+		}
+		sb.WriteString(prefix + colorBracket + "}" + colorReset)
+		return sb.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+func escapeJSON(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	s = strings.ReplaceAll(s, "\n", `\n`)
+	s = strings.ReplaceAll(s, "\r", `\r`)
+	s = strings.ReplaceAll(s, "\t", `\t`)
+	return s
 }

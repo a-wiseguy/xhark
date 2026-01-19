@@ -134,6 +134,7 @@ func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 					Required:    p.Value.Required,
 					Description: strings.TrimSpace(p.Value.Description),
 					Type:        schemaType(p.Value.Schema),
+					Example:     extractParamExample(p.Value),
 				}
 				switch p.Value.In {
 				case "path":
@@ -182,6 +183,31 @@ func schemaType(ref *openapi3.SchemaRef) model.ParamType {
 	return model.TypeUnknown
 }
 
+func extractParamExample(p *openapi3.Parameter) string {
+	if p == nil {
+		return ""
+	}
+	// check param-level example first
+	if p.Example != nil {
+		return fmt.Sprintf("%v", p.Example)
+	}
+	// check schema example
+	if p.Schema != nil && p.Schema.Value != nil && p.Schema.Value.Example != nil {
+		return fmt.Sprintf("%v", p.Schema.Value.Example)
+	}
+	return ""
+}
+
+func extractSchemaExample(ref *openapi3.SchemaRef) string {
+	if ref == nil || ref.Value == nil {
+		return ""
+	}
+	if ref.Value.Example != nil {
+		return fmt.Sprintf("%v", ref.Value.Example)
+	}
+	return ""
+}
+
 func extractBody(op *openapi3.Operation) *model.BodySchema {
 	if op == nil || op.RequestBody == nil || op.RequestBody.Value == nil {
 		return nil
@@ -209,7 +235,12 @@ func extractBody(op *openapi3.Operation) *model.BodySchema {
 		if t == model.TypeUnknown {
 			supported = false
 		}
-		fields = append(fields, model.BodyField{Name: name, Required: required[name], Type: t})
+		fields = append(fields, model.BodyField{
+			Name:     name,
+			Required: required[name],
+			Type:     t,
+			Example:  extractSchemaExample(prop),
+		})
 	}
 
 	return &model.BodySchema{Supported: supported, Fields: fields}

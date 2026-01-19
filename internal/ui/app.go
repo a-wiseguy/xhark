@@ -116,6 +116,14 @@ func (a *App) Run() error {
 	defer g.Close()
 	a.g = g
 
+	// check env for base url
+	if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
+		a.baseURL = envURL
+		if !strings.HasPrefix(a.baseURL, "http://") && !strings.HasPrefix(a.baseURL, "https://") {
+			a.baseURL = "http://" + a.baseURL
+		}
+	}
+
 	g.Cursor = true
 	g.InputEsc = true
 	g.SetManagerFunc(a.layout)
@@ -894,6 +902,8 @@ func (a *App) renderPrompt() {
 	}
 	v.Clear()
 	fmt.Fprintf(v, "%s", a.baseURL)
+	// position cursor at end
+	v.SetCursor(len(a.baseURL), 0)
 }
 
 func (a *App) appendToBaseURL(r rune) func(*gocui.Gui, *gocui.View) error {
@@ -962,6 +972,12 @@ func (a *App) renderEndpoints() {
 	v.SetCursor(0, a.selected)
 }
 
+// ansi colors for placeholders
+const (
+	colorDim   = "\033[90m" // gray for placeholder examples
+	colorReset = "\033[0m"
+)
+
 func (a *App) renderBuilder() {
 	a.renderFooter()
 
@@ -974,7 +990,12 @@ func (a *App) renderBuilder() {
 			if p.Required {
 				req = "*"
 			}
-			fmt.Fprintf(v, "%s%s = %s\n", req, p.Name, val)
+			if val == "" && p.Example != "" {
+				// show example as placeholder
+				fmt.Fprintf(v, "%s%s = %s%s%s\n", req, p.Name, colorDim, p.Example, colorReset)
+			} else {
+				fmt.Fprintf(v, "%s%s = %s\n", req, p.Name, val)
+			}
 		}
 		if len(a.activeEndpoint.PathParams) == 0 {
 			fmt.Fprintln(v, "(none)")
@@ -990,7 +1011,11 @@ func (a *App) renderBuilder() {
 			if p.Required {
 				req = "*"
 			}
-			fmt.Fprintf(v, "%s%s = %s\n", req, p.Name, val)
+			if val == "" && p.Example != "" {
+				fmt.Fprintf(v, "%s%s = %s%s%s\n", req, p.Name, colorDim, p.Example, colorReset)
+			} else {
+				fmt.Fprintf(v, "%s%s = %s\n", req, p.Name, val)
+			}
 		}
 		if len(a.activeEndpoint.QueryParams) == 0 {
 			fmt.Fprintln(v, "(none)")
@@ -1014,7 +1039,11 @@ func (a *App) renderBuilder() {
 			if f.Required {
 				req = "*"
 			}
-			fmt.Fprintf(v, "%s%s = %s\n", req, f.Name, val)
+			if val == "" && f.Example != "" {
+				fmt.Fprintf(v, "%s%s = %s%s%s\n", req, f.Name, colorDim, f.Example, colorReset)
+			} else {
+				fmt.Fprintf(v, "%s%s = %s\n", req, f.Name, val)
+			}
 		}
 		if len(a.activeEndpoint.Body.Fields) == 0 {
 			fmt.Fprintln(v, "(empty schema)")
