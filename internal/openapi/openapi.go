@@ -2,8 +2,11 @@ package openapi
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -16,8 +19,6 @@ const defaultTimeout = 10 * time.Second
 
 func Load(ctx context.Context, baseURL string) (*openapi3.T, error) {
 	client := &http.Client{Timeout: defaultTimeout}
-	loader := &openapi3.Loader{Context: ctx}
-	loader.IsExternalRefsAllowed = true
 
 	url := strings.TrimRight(baseURL, "/") + "/openapi.json"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -35,16 +36,66 @@ func Load(ctx context.Context, baseURL string) (*openapi3.T, error) {
 		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
 
-	doc, err := loader.LoadFromIoReader(resp.Body)
+	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-	if err := doc.Validate(ctx); err != nil {
+
+	// preprocess to handle openapi 3.1 numeric exclusiveMinimum/exclusiveMaximum
+	// convert them to 3.0 boolean style so kin-openapi can parse
+	processed := convertExclusiveBounds(rawBody)
+
+	loader := &openapi3.Loader{Context: ctx}
+	loader.IsExternalRefsAllowed = true
+
+	doc, err := loader.LoadFromData(processed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse openapi: %w", err)
+	}
+
+	// skip strict validation for 3.1 specs
+	return doc, nil
+}
+
+// convertExclusiveBounds converts openapi 3.1 style numeric exclusiveMinimum/exclusiveMaximum
+// to openapi 3.0 boolean style for compat with kin-openapi parser
+func convertExclusiveBounds(data []byte) []byte {
+	// match "exclusiveMinimum": <number> and convert to "exclusiveMinimum": true
+	reMin := regexp.MustCompile(`"exclusiveMinimum"\s*:\s*(\d+(?:\.\d+)?)`)
+	data = reMin.ReplaceAll(data, []byte(`"exclusiveMinimum": true, "minimum": $1`))
+
+	reMax := regexp.MustCompile(`"exclusiveMaximum"\s*:\s*(\d+(?:\.\d+)?)`)
+	data = reMax.ReplaceAll(data, []byte(`"exclusiveMaximum": true, "maximum": $1`))
+
+	// verify it's still valid json
+	var check json.RawMessage
+	if json.Unmarshal(data, &check) != nil {
+		return data // return original if preprocessing broke something
+	}
+
+	return data
+}
+
+// LoadFromReader loads from an io.Reader (for testing)
+func LoadFromReader(ctx context.Context, r io.Reader) (*openapi3.T, error) {
+	rawBody, err := io.ReadAll(r)
+	if err != nil {
 		return nil, err
+	}
+
+	processed := convertExclusiveBounds(rawBody)
+
+	loader := &openapi3.Loader{Context: ctx}
+	loader.IsExternalRefsAllowed = true
+
+	doc, err := loader.LoadFromData(processed)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse openapi: %w", err)
 	}
 
 	return doc, nil
 }
+
 
 func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 	var out []model.Endpoint

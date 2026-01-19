@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/url"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +17,20 @@ import (
 	"xhark/internal/model"
 	"xhark/internal/openapi"
 )
+
+var debugLog *log.Logger
+
+func init() {
+	// enable debug logging with XHARK_DEBUG=1
+	if os.Getenv("XHARK_DEBUG") == "1" {
+		f, err := os.OpenFile("/tmp/xhark.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+		if err == nil {
+			debugLog = log.New(f, "", log.LstdFlags)
+			return
+		}
+	}
+	debugLog = log.New(io.Discard, "", 0)
+}
 
 type screen int
 
@@ -76,6 +92,7 @@ func (a *App) Run() error {
 	a.g = g
 
 	g.Cursor = true
+	g.InputEsc = false // disable esc processing to avoid conflicts
 	g.SetManagerFunc(a.layout)
 
 	if err := a.bindKeys(); err != nil {
@@ -90,6 +107,7 @@ func (a *App) Run() error {
 
 func (a *App) layout(g *gocui.Gui) error {
 	maxX, maxY := g.Size()
+	debugLog.Printf("layout called: screen=%d, size=%dx%d", a.scr, maxX, maxY)
 
 	if v, err := g.SetView("header", 0, 0, maxX-1, 2); err != nil {
 		if err != gocui.ErrUnknownView {
@@ -99,7 +117,7 @@ func (a *App) layout(g *gocui.Gui) error {
 		fmt.Fprintln(v, "xhark  -  FastAPI OpenAPI TUI")
 	}
 
-	if v, err := g.SetView("footer", 0, maxY-2, maxX-1, maxY-1); err != nil {
+	if v, err := g.SetView("footer", 0, maxY-2, maxX-1, maxY); err != nil {
 		if err != gocui.ErrUnknownView {
 			return err
 		}
@@ -129,12 +147,11 @@ func (a *App) layoutBaseURL(maxX, maxY int) error {
 			return err
 		}
 		v.Title = "Base URL"
-		v.Editable = true
-		v.Editor = gocui.DefaultEditor
-		fmt.Fprint(v, a.baseURL)
-		if _, err := a.g.SetCurrentView("prompt"); err != nil {
-			return err
-		}
+		v.Editable = false
+	}
+	a.renderPrompt()
+	if _, err := a.g.SetCurrentView("prompt"); err != nil {
+		return err
 	}
 
 	return nil
@@ -159,13 +176,12 @@ func (a *App) layoutEndpoints(maxX, maxY int) error {
 		v.SelFgColor = gocui.ColorBlack
 		v.SelBgColor = gocui.ColorGreen
 		v.Autoscroll = false
-		if _, err := a.g.SetCurrentView("endpoints"); err != nil {
-			return err
-		}
-		a.recomputeFilter()
-		a.renderEndpoints()
 	}
 	a.renderFilter()
+	a.renderEndpoints()
+	if _, err := a.g.SetCurrentView("endpoints"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -253,10 +269,7 @@ func (a *App) bindKeys() error {
 		return err
 	}
 
-	// base url
-	if err := g.SetKeybinding("prompt", gocui.KeyEnter, gocui.ModNone, a.submitBaseURL); err != nil {
-		return err
-	}
+	// base url (handled by the prompt's custom Editor)
 
 	// endpoints list
 	if err := g.SetKeybinding("endpoints", gocui.KeyArrowDown, gocui.ModNone, a.moveSel(1)); err != nil {
@@ -333,6 +346,25 @@ func (a *App) bindKeys() error {
 		}
 	}
 
+	// base URL input: bind printable ASCII and Enter
+	for r := rune(32); r <= rune(126); r++ {
+		if err := g.SetKeybinding("prompt", r, gocui.ModNone, a.appendToBaseURL(r)); err != nil {
+			return err
+		}
+	}
+	if err := g.SetKeybinding("prompt", gocui.KeyBackspace, gocui.ModNone, a.backspaceBaseURL); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("prompt", gocui.KeyBackspace2, gocui.ModNone, a.backspaceBaseURL); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("prompt", gocui.KeyEnter, gocui.ModNone, a.submitBaseURL); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("prompt", gocui.KeyCtrlL, gocui.ModNone, a.submitBaseURL); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -355,26 +387,30 @@ func (a *App) back(*gocui.Gui, *gocui.View) error {
 }
 
 func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
-	raw := strings.TrimSpace(viewText(v))
+	debugLog.Printf("submitBaseURL called with baseURL=%q", a.baseURL)
+	raw := strings.TrimSpace(a.baseURL)
 	if raw == "" {
 		a.errorMsg = "base URL required"
+		debugLog.Printf("submitBaseURL: empty URL")
 		return nil
 	}
 	norm := normalizeBaseURL(raw)
 	if _, err := url.ParseRequestURI(norm); err != nil {
 		a.errorMsg = "invalid base URL"
+		debugLog.Printf("submitBaseURL: invalid URL %q", norm)
 		return nil
 	}
 
 	a.baseURL = norm
 	a.errorMsg = "loading openapi..."
-	a.renderFooter()
+	debugLog.Printf("submitBaseURL: loading from %q", a.baseURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	doc, err := openapi.Load(ctx, a.baseURL)
 	if err != nil {
 		a.errorMsg = err.Error()
+		debugLog.Printf("submitBaseURL: load error: %v", err)
 		return nil
 	}
 	endpoints := openapi.ExtractEndpoints(doc)
@@ -383,6 +419,7 @@ func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
 	a.selected = 0
 	a.recomputeFilter()
 
+	debugLog.Printf("submitBaseURL: loaded %d endpoints, transitioning to endpoints screen", len(endpoints))
 	a.scr = screenEndpoints
 	a.errorMsg = ""
 	return nil
@@ -698,6 +735,31 @@ func (a *App) renderFilter() {
 	}
 	v.Clear()
 	fmt.Fprintf(v, "%s", a.filter)
+}
+
+func (a *App) renderPrompt() {
+	v, err := a.g.View("prompt")
+	if err != nil {
+		return
+	}
+	v.Clear()
+	fmt.Fprintf(v, "%s", a.baseURL)
+}
+
+func (a *App) appendToBaseURL(r rune) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		a.baseURL += string(r)
+		a.renderPrompt()
+		return nil
+	}
+}
+
+func (a *App) backspaceBaseURL(*gocui.Gui, *gocui.View) error {
+	if len(a.baseURL) > 0 {
+		a.baseURL = a.baseURL[:len(a.baseURL)-1]
+		a.renderPrompt()
+	}
+	return nil
 }
 
 func (a *App) recomputeFilter() {
