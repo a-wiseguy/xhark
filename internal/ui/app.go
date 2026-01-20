@@ -470,7 +470,13 @@ func (a *App) bindKeys() error {
 	if err := g.SetKeybinding("body", gocui.KeyEnter, gocui.ModNone, a.beginEdit("body")); err != nil {
 		return err
 	}
-	if err := g.SetKeybinding("", 'd', gocui.ModNone, a.resetParam); err != nil {
+	if err := g.SetKeybinding("path", 'd', gocui.ModNone, a.resetParam); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("query", 'd', gocui.ModNone, a.resetParam); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("body", 'd', gocui.ModNone, a.resetParam); err != nil {
 		return err
 	}
 	if err := g.SetKeybinding("", gocui.KeyCtrlR, gocui.ModNone, a.executeRequest); err != nil {
