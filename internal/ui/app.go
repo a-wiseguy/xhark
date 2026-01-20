@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -116,6 +118,10 @@ func (a *App) Run() error {
 	defer g.Close()
 	a.g = g
 
+	// Set dark theme colors
+	g.BgColor = gocui.ColorBlack
+	g.FgColor = gocui.ColorWhite
+
 	// check env for base url - skip prompt if set
 	if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
 		a.baseURL = envURL
@@ -152,7 +158,9 @@ func (a *App) layout(g *gocui.Gui) error {
 			return err
 		}
 		v.Frame = false
-		fmt.Fprintln(v, "xhark  -  FastAPI OpenAPI TUI")
+		v.BgColor = gocui.ColorBlack
+		v.FgColor = gocui.ColorWhite
+		fmt.Fprintln(v, colorGreen+"xhark"+colorReset+"  -  FastAPI OpenAPI TUI")
 	}
 
 	if v, err := g.SetView("footer", 0, maxY-2, maxX-1, maxY); err != nil {
@@ -160,6 +168,8 @@ func (a *App) layout(g *gocui.Gui) error {
 			return err
 		}
 		v.Frame = false
+		v.BgColor = gocui.ColorBlack
+		v.FgColor = gocui.ColorWhite
 	}
 	a.renderFooter()
 
@@ -250,6 +260,7 @@ func (a *App) layoutBuilder(maxX, maxY int) error {
 	// clear views that won't be shown, but keep edit modal if active
 	keepViews := make([]string, len(panels))
 	copy(keepViews, panels)
+	keepViews = append(keepViews, "selected")
 	if a.editing {
 		keepViews = append(keepViews, "edit")
 	}
@@ -258,7 +269,15 @@ func (a *App) layoutBuilder(maxX, maxY int) error {
 	// ensure current pane is valid
 	a.ensureValidPane(hasPath, hasQuery, hasBody)
 
-	bodyTop := 2
+	// add selected endpoint panel at top
+	if v, err := a.g.SetView("selected", 0, 2, maxX-1, 4); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Selected endpoint"
+	}
+
+	bodyTop := 4
 	paramsBottom := maxY - 3
 	panelHeight := (paramsBottom - bodyTop) / len(panels)
 
@@ -375,7 +394,7 @@ func (a *App) clearMainViews(keep []string) {
 		keepSet[k] = true
 	}
 
-	for _, n := range []string{"prompt", "filter", "endpoints", "path", "query", "body", "edit", "response"} {
+	for _, n := range []string{"prompt", "filter", "endpoints", "selected", "path", "query", "body", "edit", "response"} {
 		if keepSet[n] {
 			continue
 		}
@@ -449,6 +468,9 @@ func (a *App) bindKeys() error {
 		return err
 	}
 	if err := g.SetKeybinding("body", gocui.KeyEnter, gocui.ModNone, a.beginEdit("body")); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("", 'd', gocui.ModNone, a.resetParam); err != nil {
 		return err
 	}
 	if err := g.SetKeybinding("", gocui.KeyCtrlR, gocui.ModNone, a.executeRequest); err != nil {
@@ -759,6 +781,42 @@ func (a *App) moveRow(viewName string, delta int) func(*gocui.Gui, *gocui.View) 
 	}
 }
 
+func (a *App) resetParam(*gocui.Gui, *gocui.View) error {
+	if a.scr != screenBuilder || a.editing {
+		return nil
+	}
+	paneName := ""
+	switch a.pane {
+	case panePath:
+		paneName = "path"
+	case paneQuery:
+		paneName = "query"
+	case paneBody:
+		paneName = "body"
+	}
+	if paneName == "" {
+		return nil
+	}
+	v, err := a.g.View(paneName)
+	if err != nil {
+		return nil
+	}
+	key := a.selectedKey(paneName, v)
+	if key == "" {
+		return nil
+	}
+	switch a.pane {
+	case panePath:
+		delete(a.pathVals, key)
+	case paneQuery:
+		delete(a.queryVals, key)
+	case paneBody:
+		delete(a.bodyVals, key)
+	}
+	a.renderBuilder()
+	return nil
+}
+
 func (a *App) beginEdit(viewName string) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if a.scr != screenBuilder || a.editing {
@@ -921,7 +979,7 @@ func (a *App) renderFooter() {
 			case screenEndpoints:
 				msg = "type: filter   1-5: quick select   enter: select   esc: back   q: quit"
 			case screenBuilder:
-				msg = "tab: switch pane   enter: edit   ctrl+r: run   esc: back"
+				msg = "tab: switch pane   enter: edit   d: reset param   ctrl+r: run   esc: back"
 			case screenResponse:
 				msg = "up/down: scroll   r: rerun   enter: back to endpoints   esc: back"
 			}
@@ -1016,19 +1074,35 @@ func (a *App) renderEndpoints() {
 		if i < 5 {
 			prefix = fmt.Sprintf("%d ", i+1)
 		}
-		fmt.Fprintf(v, "%s%s  %s%s\n", prefix, padRight(ep.Method, 6), ep.Path, label)
+		fmt.Fprintf(v, "%s%s  %s%s\n", prefix, colorizeMethod(ep.Method), highlightPathParams(ep.Path), label)
 	}
 	v.SetCursor(0, a.selected)
 }
 
-// ansi colors for placeholders
+// ansi colors
 const (
-	colorDim   = "\033[90m" // gray for placeholder examples
-	colorReset = "\033[0m"
+	colorDim     = "\033[90m" // gray for placeholder examples
+	colorReset   = "\033[0m"
+	colorRed     = "\033[31m"
+	colorGreen   = "\033[32m"
+	colorYellow  = "\033[33m"
+	colorBlue    = "\033[34m"
+	colorMagenta = "\033[35m"
+	colorCyan    = "\033[36m"
+	colorWhite   = "\033[37m"
 )
 
 func (a *App) renderBuilder() {
 	a.renderFooter()
+
+	if v, err := a.g.View("selected"); err == nil {
+		v.Clear()
+		label := firstNonEmpty(a.activeEndpoint.Summary, a.activeEndpoint.OperationID)
+		if label != "" {
+			label = " - " + label
+		}
+		fmt.Fprintf(v, "%s  %s%s\n", colorizeMethod(a.activeEndpoint.Method), highlightPathParams(a.activeEndpoint.Path), label)
+	}
 
 	if v, err := a.g.View("path"); err == nil {
 		v.Title = "Path Params"
@@ -1060,10 +1134,35 @@ func (a *App) renderBuilder() {
 			if p.Required {
 				req = "*"
 			}
-			if val == "" && p.Example != "" {
-				fmt.Fprintf(v, "%s%s = %s%s%s\n", req, p.Name, colorDim, p.Example, colorReset)
+			var display string
+			var color string
+			if val != "" {
+				display = val
+				color = colorGreen
 			} else {
-				fmt.Fprintf(v, "%s%s = %s\n", req, p.Name, val)
+				var hint string
+				var parts []string
+				if len(p.Enum) > 0 {
+					parts = append(parts, strings.Join(p.Enum, "|"))
+				}
+				if p.Default != "" {
+					parts = append(parts, "default: "+p.Default)
+				}
+				if p.Description != "" {
+					parts = append(parts, p.Description)
+				}
+				hint = strings.Join(parts, ", ")
+				if hint != "" {
+					display = hint
+				} else if p.Example != "" {
+					display = p.Example
+				}
+				color = colorCyan
+			}
+			if display != "" {
+				fmt.Fprintf(v, "%s%s = %s%s%s\n", req, p.Name, color, display, colorReset)
+			} else {
+				fmt.Fprintf(v, "%s%s = \n", req, p.Name)
 			}
 		}
 		if len(a.activeEndpoint.QueryParams) == 0 {
@@ -1109,7 +1208,7 @@ func (a *App) renderResponse() {
 	v.Clear()
 
 	r := a.lastRes
-	fmt.Fprintf(v, "%s\n", r.Status)
+	fmt.Fprintf(v, "%s\n", colorizeStatus(r.Status))
 	fmt.Fprintf(v, "elapsed: %s\n", r.Elapsed)
 	if ct, ok := r.Headers["content-type"]; ok {
 		fmt.Fprintf(v, "content-type: %s\n", ct)
@@ -1178,4 +1277,53 @@ func padRight(s string, n int) string {
 		return s
 	}
 	return s + strings.Repeat(" ", n-len(s))
+}
+
+func colorizeMethod(method string) string {
+	var color string
+	switch strings.ToUpper(method) {
+	case "GET":
+		color = colorBlue
+	case "POST":
+		color = colorGreen
+	case "PUT":
+		color = colorYellow
+	case "DELETE":
+		color = colorRed
+	case "PATCH":
+		color = colorCyan
+	case "HEAD":
+		color = colorMagenta
+	default:
+		color = colorReset
+	}
+	return color + padRight(method, 6) + colorReset
+}
+
+func colorizeStatus(status string) string {
+	parts := strings.Fields(status)
+	if len(parts) == 0 {
+		return status
+	}
+	codeStr := parts[0]
+	code, err := strconv.Atoi(codeStr)
+	if err != nil {
+		return status
+	}
+	var color string
+	if code >= 200 && code < 300 {
+		color = colorGreen
+	} else if code >= 400 && code < 500 {
+		color = colorYellow
+	} else if code >= 500 {
+		color = colorRed
+	} else {
+		color = colorReset
+	}
+	return color + status + colorReset
+}
+
+func highlightPathParams(path string) string {
+	re := regexp.MustCompile(`\{([^}]+)\}`)
+	return re.ReplaceAllString(path, colorCyan+"{$1}"+colorReset)
 }

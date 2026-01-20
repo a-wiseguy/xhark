@@ -96,7 +96,6 @@ func LoadFromReader(ctx context.Context, r io.Reader) (*openapi3.T, error) {
 	return doc, nil
 }
 
-
 func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 	var out []model.Endpoint
 	if doc == nil || doc.Paths == nil {
@@ -135,6 +134,8 @@ func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 					Description: strings.TrimSpace(p.Value.Description),
 					Type:        schemaType(p.Value.Schema),
 					Example:     extractParamExample(p.Value),
+					Enum:        extractEnum(p.Value.Schema),
+					Default:     extractDefault(p.Value.Schema),
 				}
 				switch p.Value.In {
 				case "path":
@@ -196,6 +197,24 @@ func extractParamExample(p *openapi3.Parameter) string {
 		return fmt.Sprintf("%v", p.Schema.Value.Example)
 	}
 	return ""
+}
+
+func extractEnum(ref *openapi3.SchemaRef) []string {
+	if ref == nil || ref.Value == nil || ref.Value.Enum == nil {
+		return nil
+	}
+	var enums []string
+	for _, e := range ref.Value.Enum {
+		enums = append(enums, fmt.Sprintf("%v", e))
+	}
+	return enums
+}
+
+func extractDefault(ref *openapi3.SchemaRef) string {
+	if ref == nil || ref.Value == nil || ref.Value.Default == nil {
+		return ""
+	}
+	return fmt.Sprintf("%v", ref.Value.Default)
 }
 
 func extractSchemaExample(ref *openapi3.SchemaRef) string {

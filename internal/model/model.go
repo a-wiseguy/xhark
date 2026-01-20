@@ -22,6 +22,8 @@ type Param struct {
 	Type        ParamType
 	Description string
 	Example     string
+	Enum        []string
+	Default     string
 }
 
 type BodyField struct {
