@@ -27,10 +27,13 @@ type Param struct {
 }
 
 type BodyField struct {
-	Name     string
-	Required bool
-	Type     ParamType
-	Example  string
+	Name        string
+	Required    bool
+	Type        ParamType
+	Description string
+	Example     string
+	Enum        []string
+	Default     string
 }
 
 type BodySchema struct {

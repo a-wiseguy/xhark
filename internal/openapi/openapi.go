@@ -255,10 +255,13 @@ func extractBody(op *openapi3.Operation) *model.BodySchema {
 			supported = false
 		}
 		fields = append(fields, model.BodyField{
-			Name:     name,
-			Required: required[name],
-			Type:     t,
-			Example:  extractSchemaExample(prop),
+			Name:        name,
+			Required:    required[name],
+			Type:        t,
+			Description: strings.TrimSpace(prop.Value.Description),
+			Example:     extractSchemaExample(prop),
+			Enum:        extractEnum(prop),
+			Default:     extractDefault(prop),
 		})
 	}
 

@@ -847,6 +847,7 @@ func (a *App) resetParam(*gocui.Gui, *gocui.View) error {
 		delete(a.queryVals, key)
 	case paneBody:
 		delete(a.bodyVals, key)
+		a.bodyRaw = ""
 	}
 	a.renderBuilder()
 	return nil
@@ -859,11 +860,7 @@ func (a *App) bodyEnter(g *gocui.Gui, v *gocui.View) error {
 	if a.activeEndpoint.Body == nil {
 		return nil
 	}
-	// If the endpoint has a structured schema, keep the existing field editor.
-	if a.activeEndpoint.Body.Supported {
-		return a.beginEdit("body")(g, v)
-	}
-	// Otherwise drop into $EDITOR for raw JSON.
+	// Always drop into $EDITOR for JSON body editing.
 	return a.editBodyInEditor(g, v)
 }
 
@@ -875,16 +872,31 @@ func (a *App) editBodyInEditor(*gocui.Gui, *gocui.View) error {
 		return nil
 	}
 
-	// Seed with existing raw JSON, otherwise best-effort from bodyVals.
+	// Seed with existing raw JSON, otherwise generate a "swagger-like" starter
+	// object using defaults/examples when available.
 	seed := strings.TrimSpace(a.bodyRaw)
 	if seed == "" {
 		obj := map[string]any{}
-		for _, f := range a.activeEndpoint.Body.Fields {
-			raw := strings.TrimSpace(a.bodyVals[f.Name])
-			if raw == "" {
-				continue
+		if a.activeEndpoint.Body != nil {
+			for _, f := range a.activeEndpoint.Body.Fields {
+				// Prefer explicit default, then example.
+				val := strings.TrimSpace(f.Default)
+				if val == "" {
+					val = strings.TrimSpace(f.Example)
+				}
+
+				// If the user has previously used the old field-based editor, use that
+				// as the last-resort seed.
+				if val == "" {
+					val = strings.TrimSpace(a.bodyVals[f.Name])
+				}
+
+				if val == "" {
+					continue
+				}
+
+				obj[f.Name] = coerceJSONScalar(f.Type, val)
 			}
-			obj[f.Name] = raw
 		}
 		if len(obj) > 0 {
 			if b, err := json.MarshalIndent(obj, "", "  "); err == nil {
@@ -970,6 +982,25 @@ func splitCommand(s string) []string {
 		return []string{"vi"}
 	}
 	return fields
+}
+
+func coerceJSONScalar(t model.ParamType, raw string) any {
+	raw = strings.TrimSpace(raw)
+	switch t {
+	case model.TypeBoolean:
+		if b, err := strconv.ParseBool(raw); err == nil {
+			return b
+		}
+	case model.TypeInteger:
+		if i, err := strconv.ParseInt(raw, 10, 64); err == nil {
+			return i
+		}
+	case model.TypeNumber:
+		if f, err := strconv.ParseFloat(raw, 64); err == nil {
+			return f
+		}
+	}
+	return raw
 }
 
 func (a *App) beginEdit(viewName string) func(*gocui.Gui, *gocui.View) error {
@@ -1135,7 +1166,7 @@ func (a *App) renderFooter() {
 				msg = "type: filter   1-5: quick select   enter: select   esc: back   q: quit"
 			case screenBuilder:
 				msg = "tab: switch pane   enter: edit   d: reset param   ctrl+r: run   esc: back"
-				if a.pane == paneBody && a.activeEndpoint.Body != nil && !a.activeEndpoint.Body.Supported {
+				if a.pane == paneBody && a.activeEndpoint.Body != nil {
 					msg = "tab: switch pane   enter: edit json ($EDITOR)   d: reset param   ctrl+r: run   esc: back"
 				}
 			case screenResponse:
@@ -1260,6 +1291,9 @@ func (a *App) renderBuilder() {
 			label = " - " + label
 		}
 		fmt.Fprintf(v, "%s  %s%s\n", colorizeMethod(a.activeEndpoint.Method), highlightPathParams(a.activeEndpoint.Path), label)
+		if strings.TrimSpace(a.bodyRaw) != "" {
+			fmt.Fprintf(v, "%sbody: raw json set%s\n", colorCyan, colorReset)
+		}
 	}
 
 	if v, err := a.g.View("path"); err == nil {
