@@ -1,12 +1,15 @@
 package ui
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/url"
 	"os"
+	"os/exec"
 	"regexp"
 	"sort"
 	"strconv"
@@ -70,11 +73,14 @@ type App struct {
 	pathVals       map[string]string
 	queryVals      map[string]string
 	bodyVals       map[string]string
+	bodyRaw        string
 
 	pane focusPane
 
 	editing    bool
 	editTarget string
+
+	suspendEditorFile string
 
 	lastReq  httpclient.RequestSpec
 	lastRes  httpclient.Result
@@ -111,43 +117,65 @@ func (e singleLineEditor) Edit(v *gocui.View, key gocui.Key, ch rune, mod gocui.
 }
 
 func (a *App) Run() error {
-	g, err := gocui.NewGui(gocui.OutputNormal)
-	if err != nil {
-		return err
-	}
-	defer g.Close()
-	a.g = g
-
-	// Set dark theme colors
-	g.BgColor = gocui.ColorBlack
-	g.FgColor = gocui.ColorWhite
-
-	// check env for base url - skip prompt if set
-	if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
-		a.baseURL = envURL
-		if !strings.HasPrefix(a.baseURL, "http://") && !strings.HasPrefix(a.baseURL, "https://") {
-			a.baseURL = "http://" + a.baseURL
+	// We sometimes need to temporarily drop out of the TUI to run an external
+	// process (e.g. $EDITOR for JSON body editing). gocui doesn't expose a native
+	// suspend/resume API, so we exit the main loop, run the external command, and
+	// then re-create the GUI.
+	for {
+		g, err := gocui.NewGui(gocui.OutputNormal)
+		if err != nil {
+			return err
 		}
-		// load endpoints immediately
-		if err := a.loadEndpoints(); err != nil {
-			a.errorMsg = "error: " + err.Error()
-		} else {
-			a.scr = screenEndpoints
+		a.g = g
+
+		// Set dark theme colors
+		g.BgColor = gocui.ColorBlack
+		g.FgColor = gocui.ColorWhite
+
+		// check env for base url - skip prompt if set
+		if a.scr == screenBaseURL {
+			if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
+				a.baseURL = envURL
+				if !strings.HasPrefix(a.baseURL, "http://") && !strings.HasPrefix(a.baseURL, "https://") {
+					a.baseURL = "http://" + a.baseURL
+				}
+				// load endpoints immediately
+				if err := a.loadEndpoints(); err != nil {
+					a.errorMsg = "error: " + err.Error()
+				} else {
+					a.scr = screenEndpoints
+				}
+			}
 		}
-	}
 
-	g.Cursor = true
-	g.InputEsc = true
-	g.SetManagerFunc(a.layout)
+		g.Cursor = true
+		g.InputEsc = true
+		g.SetManagerFunc(a.layout)
 
-	if err := a.bindKeys(); err != nil {
-		return err
-	}
+		if err := a.bindKeys(); err != nil {
+			g.Close()
+			return err
+		}
 
-	if err := g.MainLoop(); err != nil && err != gocui.ErrQuit {
-		return err
+		err = g.MainLoop()
+		g.Close()
+
+		// If we asked to suspend into an external editor, do that and resume.
+		if a.suspendEditorFile != "" {
+			file := a.suspendEditorFile
+			a.suspendEditorFile = ""
+			if err := a.runExternalEditor(file); err != nil {
+				a.errorMsg = err.Error()
+			}
+			// regardless of editor success, resume the app
+			continue
+		}
+
+		if err != nil && err != gocui.ErrQuit {
+			return err
+		}
+		return nil
 	}
-	return nil
 }
 
 func (a *App) layout(g *gocui.Gui) error {
@@ -467,7 +495,7 @@ func (a *App) bindKeys() error {
 	if err := g.SetKeybinding("query", gocui.KeyEnter, gocui.ModNone, a.beginEdit("query")); err != nil {
 		return err
 	}
-	if err := g.SetKeybinding("body", gocui.KeyEnter, gocui.ModNone, a.beginEdit("body")); err != nil {
+	if err := g.SetKeybinding("body", gocui.KeyEnter, gocui.ModNone, a.bodyEnter); err != nil {
 		return err
 	}
 	if err := g.SetKeybinding("path", 'd', gocui.ModNone, a.resetParam); err != nil {
@@ -671,6 +699,7 @@ func (a *App) openBuilder(*gocui.Gui, *gocui.View) error {
 	a.pathVals = map[string]string{}
 	a.queryVals = map[string]string{}
 	a.bodyVals = map[string]string{}
+	a.bodyRaw = ""
 	a.pane = panePath
 	a.scr = screenBuilder
 	a.errorMsg = ""
@@ -823,6 +852,126 @@ func (a *App) resetParam(*gocui.Gui, *gocui.View) error {
 	return nil
 }
 
+func (a *App) bodyEnter(g *gocui.Gui, v *gocui.View) error {
+	if a.scr != screenBuilder || a.editing {
+		return nil
+	}
+	if a.activeEndpoint.Body == nil {
+		return nil
+	}
+	// If the endpoint has a structured schema, keep the existing field editor.
+	if a.activeEndpoint.Body.Supported {
+		return a.beginEdit("body")(g, v)
+	}
+	// Otherwise drop into $EDITOR for raw JSON.
+	return a.editBodyInEditor(g, v)
+}
+
+func (a *App) editBodyInEditor(*gocui.Gui, *gocui.View) error {
+	if a.scr != screenBuilder || a.editing {
+		return nil
+	}
+	if a.activeEndpoint.Body == nil {
+		return nil
+	}
+
+	// Seed with existing raw JSON, otherwise best-effort from bodyVals.
+	seed := strings.TrimSpace(a.bodyRaw)
+	if seed == "" {
+		obj := map[string]any{}
+		for _, f := range a.activeEndpoint.Body.Fields {
+			raw := strings.TrimSpace(a.bodyVals[f.Name])
+			if raw == "" {
+				continue
+			}
+			obj[f.Name] = raw
+		}
+		if len(obj) > 0 {
+			if b, err := json.MarshalIndent(obj, "", "  "); err == nil {
+				seed = string(b)
+			}
+		}
+	}
+	if seed == "" {
+		seed = "{}\n"
+	} else if !strings.HasSuffix(seed, "\n") {
+		seed += "\n"
+	}
+
+	// Write to temp file and request that Run() suspends into $EDITOR.
+	f, err := os.CreateTemp("", "xhark-body-*.json")
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+	if _, err := io.Copy(f, bytes.NewBufferString(seed)); err != nil {
+		return nil
+	}
+	a.suspendEditorFile = f.Name()
+	return gocui.ErrQuit
+}
+
+func (a *App) runExternalEditor(file string) error {
+	editor := strings.TrimSpace(os.Getenv("XHARK_EDITOR"))
+	if editor == "" {
+		editor = strings.TrimSpace(os.Getenv("EDITOR"))
+	}
+	if editor == "" {
+		editor = "vi"
+	}
+
+	args := splitCommand(editor)
+	cmdName := args[0]
+	cmdArgs := append(args[1:], file)
+	cmd := exec.Command(cmdName, cmdArgs...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		return err
+	}
+
+	b, err := os.ReadFile(file)
+	_ = os.Remove(file)
+	if err != nil {
+		return err
+	}
+
+	raw := strings.TrimSpace(string(b))
+	if raw == "" {
+		a.bodyRaw = ""
+		return nil
+	}
+
+	// Validate JSON and normalize it.
+	var v any
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&v); err != nil {
+		return fmt.Errorf("invalid json body: %w", err)
+	}
+	// Reject trailing junk (second JSON value)
+	if dec.More() {
+		return fmt.Errorf("invalid json body: multiple json values")
+	}
+	norm, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	a.bodyRaw = string(norm)
+	return nil
+}
+
+func splitCommand(s string) []string {
+	// Minimal shell-like splitting: whitespace, no quotes/escapes.
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return []string{"vi"}
+	}
+	return fields
+}
+
 func (a *App) beginEdit(viewName string) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if a.scr != screenBuilder || a.editing {
@@ -921,7 +1070,7 @@ func (a *App) executeRequest(*gocui.Gui, *gocui.View) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
-	req, err := httpclient.BuildRequest(a.baseURL, a.activeEndpoint, a.pathVals, a.queryVals, a.bodyVals)
+	req, err := httpclient.BuildRequest(a.baseURL, a.activeEndpoint, a.pathVals, a.queryVals, a.bodyVals, a.bodyRaw)
 	if err != nil {
 		a.errorMsg = err.Error()
 		return nil
@@ -986,6 +1135,9 @@ func (a *App) renderFooter() {
 				msg = "type: filter   1-5: quick select   enter: select   esc: back   q: quit"
 			case screenBuilder:
 				msg = "tab: switch pane   enter: edit   d: reset param   ctrl+r: run   esc: back"
+				if a.pane == paneBody && a.activeEndpoint.Body != nil && !a.activeEndpoint.Body.Supported {
+					msg = "tab: switch pane   enter: edit json ($EDITOR)   d: reset param   ctrl+r: run   esc: back"
+				}
 			case screenResponse:
 				msg = "up/down: scroll   r: rerun   enter: back to endpoints   esc: back"
 			}

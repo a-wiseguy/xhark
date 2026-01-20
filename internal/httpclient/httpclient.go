@@ -32,7 +32,7 @@ type RequestSpec struct {
 
 const defaultTimeout = 10 * time.Second
 
-func BuildRequest(baseURL string, ep model.Endpoint, pathVals, queryVals, bodyVals map[string]string) (RequestSpec, error) {
+func BuildRequest(baseURL string, ep model.Endpoint, pathVals, queryVals, bodyVals map[string]string, bodyRaw string) (RequestSpec, error) {
 	path, err := substitutePath(ep.Path, ep.PathParams, pathVals)
 	if err != nil {
 		return RequestSpec{}, err
@@ -78,11 +78,21 @@ func BuildRequest(baseURL string, ep model.Endpoint, pathVals, queryVals, bodyVa
 
 	var body []byte
 	if shouldSendBody(ep) {
-		b, err := buildJSONBody(ep, bodyVals)
-		if err != nil {
-			return RequestSpec{}, err
+		// If the user provided a raw JSON body (from $EDITOR), prefer that.
+		raw := strings.TrimSpace(bodyRaw)
+		if raw != "" {
+			var check any
+			if err := json.Unmarshal([]byte(raw), &check); err != nil {
+				return RequestSpec{}, fmt.Errorf("invalid json body: %w", err)
+			}
+			body = []byte(raw)
+		} else {
+			b, err := buildJSONBody(ep, bodyVals)
+			if err != nil {
+				return RequestSpec{}, err
+			}
+			body = b
 		}
-		body = b
 		if body != nil {
 			headers["Content-Type"] = "application/json"
 		}
@@ -222,12 +232,12 @@ func formatBody(contentType string, body []byte) string {
 // ansi color codes
 const (
 	colorReset   = "\033[0m"
-	colorKey     = "\033[36m"  // cyan for keys
-	colorString  = "\033[32m"  // green for strings
-	colorNumber  = "\033[33m"  // yellow for numbers
-	colorBool    = "\033[35m"  // magenta for booleans
-	colorNull    = "\033[90m"  // gray for null
-	colorBracket = "\033[37m"  // white for brackets
+	colorKey     = "\033[36m" // cyan for keys
+	colorString  = "\033[32m" // green for strings
+	colorNumber  = "\033[33m" // yellow for numbers
+	colorBool    = "\033[35m" // magenta for booleans
+	colorNull    = "\033[90m" // gray for null
+	colorBracket = "\033[37m" // white for brackets
 )
 
 func colorizeJSON(v any, indent int) string {
