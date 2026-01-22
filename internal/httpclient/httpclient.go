@@ -276,8 +276,6 @@ func FetchOAuthPasswordToken(ctx context.Context, baseURL string, tokenURL strin
 		low := strings.ToLower(tt)
 		if low == "bearer" {
 			tt = "Bearer"
-		} else {
-			tt = tt
 		}
 	}
 	return tr.AccessToken, tt, nil

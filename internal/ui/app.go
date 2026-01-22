@@ -10,12 +10,14 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/getkin/kin-openapi/openapi3"
 	"github.com/jroimartin/gocui"
 
 	"xhark/internal/httpclient"
@@ -40,8 +42,7 @@ func init() {
 type screen int
 
 const (
-	screenBaseURL screen = iota
-	screenEndpoints
+	screenEndpoints screen = iota
 	screenBuilder
 	screenResponse
 )
@@ -78,6 +79,7 @@ type App struct {
 
 	scr screen
 
+	specURL    string
 	baseURL    string
 	endpoints  []model.Endpoint
 	secSchemes map[string]model.SecurityScheme
@@ -119,7 +121,28 @@ type App struct {
 }
 
 func NewApp(in io.Reader, out io.Writer) *App {
-	return &App{in: in, out: out, scr: screenBaseURL, authStore: map[string]authState{}}
+	return &App{in: in, out: out, scr: screenEndpoints, authStore: map[string]authState{}}
+}
+
+func (a *App) SetSpec(spec string) {
+	a.specURL = strings.TrimSpace(spec)
+}
+
+func (a *App) SetBaseURL(baseURL string) {
+	a.baseURL = normalizeBaseURL(baseURL)
+}
+
+// Init loads the OpenAPI spec and prepares the endpoint list.
+func (a *App) Init() error {
+	if strings.TrimSpace(a.specURL) == "" {
+		return fmt.Errorf("spec required (use --spec-url or --spec-file, or set XHARK_SPEC_URL/XHARK_SPEC_FILE)")
+	}
+
+	if strings.HasPrefix(a.specURL, "http://") || strings.HasPrefix(a.specURL, "https://") {
+		a.baseURL = baseURLFromURLSpec(a.specURL)
+	}
+
+	return a.loadEndpoints()
 }
 
 // singleLineEditor is an editor that doesn't consume Enter (lets keybinding handle it)
@@ -190,22 +213,6 @@ func (a *App) Run() error {
 		g.BgColor = gocui.ColorBlack
 		g.FgColor = gocui.ColorWhite
 
-		// check env for base url - skip prompt if set
-		if a.scr == screenBaseURL {
-			if envURL := os.Getenv("XHARK_BASE_URL"); envURL != "" {
-				a.baseURL = envURL
-				if !strings.HasPrefix(a.baseURL, "http://") && !strings.HasPrefix(a.baseURL, "https://") {
-					a.baseURL = "http://" + a.baseURL
-				}
-				// load endpoints immediately
-				if err := a.loadEndpoints(); err != nil {
-					a.errorMsg = "error: " + err.Error()
-				} else {
-					a.scr = screenEndpoints
-				}
-			}
-		}
-
 		g.Cursor = true
 		g.InputEsc = true
 		g.SetManagerFunc(a.layout)
@@ -246,7 +253,7 @@ func (a *App) layout(g *gocui.Gui) error {
 		v.Frame = false
 		v.BgColor = gocui.ColorBlack
 		v.FgColor = gocui.ColorWhite
-		fmt.Fprintln(v, colorGreen+"xhark"+colorReset+"  -  FastAPI OpenAPI TUI")
+		fmt.Fprintln(v, colorGreen+"xhark"+colorReset+"  -  OpenAPI TUI")
 	}
 
 	if v, err := g.SetView("footer", 0, maxY-2, maxX-1, maxY); err != nil {
@@ -264,8 +271,6 @@ func (a *App) layout(g *gocui.Gui) error {
 	}
 
 	switch a.scr {
-	case screenBaseURL:
-		return a.layoutBaseURL(maxX, maxY)
 	case screenEndpoints:
 		return a.layoutEndpoints(maxX, maxY)
 	case screenBuilder:
@@ -334,24 +339,6 @@ func (a *App) layoutAuth(maxX, maxY int) error {
 	_, _ = a.g.SetViewOnTop("auth-form")
 	_, _ = a.g.SetViewOnTop("auth-schemes")
 	_, _ = a.g.SetViewOnTop("auth-box")
-	return nil
-}
-
-func (a *App) layoutBaseURL(maxX, maxY int) error {
-	a.clearMainViews([]string{"prompt"})
-
-	if v, err := a.g.SetView("prompt", 0, 2, maxX-1, 6); err != nil {
-		if err != gocui.ErrUnknownView {
-			return err
-		}
-		v.Title = "Base URL"
-		v.Editable = false
-	}
-	a.renderPrompt()
-	if _, err := a.g.SetCurrentView("prompt"); err != nil {
-		return err
-	}
-
 	return nil
 }
 
@@ -544,7 +531,7 @@ func (a *App) clearMainViews(keep []string) {
 		keepSet[k] = true
 	}
 
-	for _, n := range []string{"prompt", "filter", "endpoints", "selected", "path", "query", "body", "edit", "response"} {
+	for _, n := range []string{"filter", "endpoints", "selected", "path", "query", "body", "edit", "response"} {
 		if keepSet[n] {
 			continue
 		}
@@ -568,7 +555,7 @@ func (a *App) bindKeys() error {
 		return err
 	}
 
-	// base url (handled by the prompt's custom Editor)
+	// spec url (handled by the prompt's custom Editor)
 
 	// endpoints list
 	if err := g.SetKeybinding("endpoints", gocui.KeyArrowDown, gocui.ModNone, a.moveSel(1)); err != nil {
@@ -663,25 +650,6 @@ func (a *App) bindKeys() error {
 		}
 	}
 
-	// base URL input: bind printable ASCII and Enter
-	for r := rune(32); r <= rune(126); r++ {
-		if err := g.SetKeybinding("prompt", r, gocui.ModNone, a.appendToBaseURL(r)); err != nil {
-			return err
-		}
-	}
-	if err := g.SetKeybinding("prompt", gocui.KeyBackspace, gocui.ModNone, a.backspaceBaseURL); err != nil {
-		return err
-	}
-	if err := g.SetKeybinding("prompt", gocui.KeyBackspace2, gocui.ModNone, a.backspaceBaseURL); err != nil {
-		return err
-	}
-	if err := g.SetKeybinding("prompt", gocui.KeyEnter, gocui.ModNone, a.submitBaseURL); err != nil {
-		return err
-	}
-	if err := g.SetKeybinding("prompt", gocui.KeyCtrlL, gocui.ModNone, a.submitBaseURL); err != nil {
-		return err
-	}
-
 	// auth modal keys
 	if err := g.SetKeybinding("auth-schemes", gocui.KeyArrowDown, gocui.ModNone, a.moveAuthSel(1)); err != nil {
 		return err
@@ -733,7 +701,7 @@ func (a *App) back(*gocui.Gui, *gocui.View) error {
 	case screenBuilder:
 		a.scr = screenEndpoints
 	case screenEndpoints:
-		a.scr = screenBaseURL
+		// no previous screen
 	}
 	a.errorMsg = ""
 	return nil
@@ -1042,40 +1010,18 @@ func mask(s string) string {
 	return strings.Repeat("*", len(s))
 }
 
-func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
-	raw := strings.TrimSpace(a.baseURL)
-	if raw == "" {
-		a.errorMsg = "base URL required"
-		return nil
-	}
-	norm := normalizeBaseURL(raw)
-	if _, err := url.ParseRequestURI(norm); err != nil {
-		a.errorMsg = "invalid base URL"
-		return nil
-	}
-
-	a.baseURL = norm
-	a.errorMsg = "loading openapi..."
-
-	if err := a.loadEndpoints(); err != nil {
-		a.errorMsg = err.Error()
-		return nil
-	}
-
-	a.scr = screenEndpoints
-	a.errorMsg = ""
-	return nil
-}
-
 func (a *App) loadEndpoints() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	doc, err := openapi.Load(ctx, a.baseURL)
+	doc, err := openapi.Load(ctx, a.specURL)
 	if err != nil {
 		return err
 	}
 	a.endpoints = openapi.ExtractEndpoints(doc)
 	a.secSchemes = openapi.ExtractSecuritySchemes(doc)
+	if a.baseURL == "" {
+		a.baseURL = baseURLFromOpenAPI(doc)
+	}
 	a.filter = ""
 	a.selected = 0
 	a.recomputeFilter()
@@ -1083,10 +1029,52 @@ func (a *App) loadEndpoints() error {
 }
 
 func normalizeBaseURL(in string) string {
+	in = strings.TrimSpace(in)
+	if in == "" {
+		return ""
+	}
 	if strings.HasPrefix(in, "http://") || strings.HasPrefix(in, "https://") {
 		return in
 	}
 	return "http://" + in
+}
+
+func baseURLFromURLSpec(specURL string) string {
+	specURL = strings.TrimSpace(specURL)
+	if specURL == "" {
+		return ""
+	}
+	u, err := url.Parse(specURL)
+	if err != nil {
+		return ""
+	}
+	u.Fragment = ""
+	u.RawQuery = ""
+	u.Path = path.Dir(u.Path)
+	if u.Path == "." {
+		u.Path = ""
+	}
+	return strings.TrimRight(u.String(), "/")
+}
+
+func baseURLFromOpenAPI(doc *openapi3.T) string {
+	if doc == nil {
+		return ""
+	}
+	if len(doc.Servers) == 0 {
+		return ""
+	}
+	u := strings.TrimSpace(doc.Servers[0].URL)
+	// For now, we only support concrete URLs (no {vars}).
+	if u == "" || strings.Contains(u, "{") {
+		return ""
+	}
+	if p, err := url.Parse(u); err == nil {
+		p.Fragment = ""
+		p.RawQuery = ""
+		return strings.TrimRight(p.String(), "/")
+	}
+	return ""
 }
 
 func (a *App) captureRune(g *gocui.Gui, v *gocui.View) error {
@@ -1104,9 +1092,6 @@ func (a *App) captureRune(g *gocui.Gui, v *gocui.View) error {
 func (a *App) appendFilterRune(r rune) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if a.scr != screenEndpoints || a.editing {
-			return nil
-		}
-		if v != nil && v.Name() == "prompt" {
 			return nil
 		}
 		a.filter += string(r)
@@ -1591,6 +1576,10 @@ func (a *App) executeRequest(*gocui.Gui, *gocui.View) error {
 	if a.scr != screenBuilder || a.editing {
 		return nil
 	}
+	if strings.TrimSpace(a.baseURL) == "" {
+		a.errorMsg = "base URL unknown (spec missing servers); set XHARK_BASE_URL, or load spec from an http(s) URL"
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
@@ -1662,11 +1651,6 @@ func (a *App) renderFooter() {
 		msg := a.errorMsg
 		if msg == "" {
 			switch a.scr {
-			case screenBaseURL:
-				msg = "enter: load openapi   q: quit"
-				if len(a.secSchemes) > 0 {
-					msg = "enter: load openapi   A: auth   q: quit"
-				}
 			case screenEndpoints:
 				msg = "type: filter   1-5: quick select   enter: select   esc: back   A: auth   q: quit"
 			case screenBuilder:
@@ -1689,33 +1673,6 @@ func (a *App) renderFilter() {
 	}
 	v.Clear()
 	fmt.Fprintf(v, "%s", a.filter)
-}
-
-func (a *App) renderPrompt() {
-	v, err := a.g.View("prompt")
-	if err != nil {
-		return
-	}
-	v.Clear()
-	fmt.Fprintf(v, "%s", a.baseURL)
-	// position cursor at end
-	v.SetCursor(len(a.baseURL), 0)
-}
-
-func (a *App) appendToBaseURL(r rune) func(*gocui.Gui, *gocui.View) error {
-	return func(g *gocui.Gui, v *gocui.View) error {
-		a.baseURL += string(r)
-		a.renderPrompt()
-		return nil
-	}
-}
-
-func (a *App) backspaceBaseURL(*gocui.Gui, *gocui.View) error {
-	if len(a.baseURL) > 0 {
-		a.baseURL = a.baseURL[:len(a.baseURL)-1]
-		a.renderPrompt()
-	}
-	return nil
 }
 
 func (a *App) recomputeFilter() {

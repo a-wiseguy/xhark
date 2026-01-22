@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -17,11 +20,26 @@ import (
 
 const defaultTimeout = 10 * time.Second
 
-func Load(ctx context.Context, baseURL string) (*openapi3.T, error) {
+func Load(ctx context.Context, spec string) (*openapi3.T, error) {
 	client := &http.Client{Timeout: defaultTimeout}
 
-	url := strings.TrimRight(baseURL, "/") + "/openapi.json"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	spec = strings.TrimSpace(spec)
+	if strings.HasPrefix(spec, "blob:") {
+		spec = strings.TrimSpace(strings.TrimPrefix(spec, "blob:"))
+	}
+	if spec == "" {
+		return nil, fmt.Errorf("spec URL or file path required")
+	}
+
+	// Local file: allow explicit @path, otherwise treat non-http(s) input as a file path.
+	if strings.HasPrefix(spec, "@") {
+		return loadFromFilePath(ctx, strings.TrimSpace(strings.TrimPrefix(spec, "@")))
+	}
+	if !strings.HasPrefix(spec, "http://") && !strings.HasPrefix(spec, "https://") {
+		return loadFromFilePath(ctx, spec)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, spec, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -33,7 +51,7 @@ func Load(ctx context.Context, baseURL string) (*openapi3.T, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
+		return nil, fmt.Errorf("GET %s: %s", spec, resp.Status)
 	}
 
 	rawBody, err := io.ReadAll(resp.Body)
@@ -48,12 +66,52 @@ func Load(ctx context.Context, baseURL string) (*openapi3.T, error) {
 	loader := &openapi3.Loader{Context: ctx}
 	loader.IsExternalRefsAllowed = true
 
-	doc, err := loader.LoadFromData(processed)
+	location, _ := url.Parse(spec)
+	doc, err := loader.LoadFromDataWithPath(processed, location)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse openapi: %w", err)
 	}
 
-	// skip strict validation for 3.1 specs
+	return doc, nil
+}
+
+func loadFromFilePath(ctx context.Context, p string) (*openapi3.T, error) {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return nil, fmt.Errorf("spec file path required")
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		h, err := os.UserHomeDir()
+		if err == nil && h != "" {
+			if p == "~" {
+				p = h
+			} else {
+				p = filepath.Join(h, strings.TrimPrefix(p, "~/"))
+			}
+		}
+	}
+	if !filepath.IsAbs(p) {
+		if cwd, err := os.Getwd(); err == nil {
+			p = filepath.Join(cwd, p)
+		}
+	}
+	p = filepath.Clean(p)
+
+	rawBody, err := os.ReadFile(p)
+	if err != nil {
+		return nil, fmt.Errorf("read spec file %s: %w", p, err)
+	}
+
+	processed := convertExclusiveBounds(rawBody)
+
+	loader := &openapi3.Loader{Context: ctx}
+	loader.IsExternalRefsAllowed = true
+
+	location := &url.URL{Scheme: "file", Path: p}
+	doc, err := loader.LoadFromDataWithPath(processed, location)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse openapi: %w", err)
+	}
 	return doc, nil
 }
 
