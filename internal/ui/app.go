@@ -54,6 +54,22 @@ const (
 	paneBody
 )
 
+type authState struct {
+	schemeName string
+	token      string
+	tokenType  string
+	acquiredAt time.Time
+}
+
+type authMode int
+
+const (
+	authModeToken authMode = iota
+	authModeUser
+	authModePass
+	authModeScope
+)
+
 type App struct {
 	in  io.Reader
 	out io.Writer
@@ -62,8 +78,9 @@ type App struct {
 
 	scr screen
 
-	baseURL   string
-	endpoints []model.Endpoint
+	baseURL    string
+	endpoints  []model.Endpoint
+	secSchemes map[string]model.SecurityScheme
 
 	filter   string
 	filtered []int
@@ -80,6 +97,20 @@ type App struct {
 	editing    bool
 	editTarget string
 
+	// Auth dialog state
+	authOpen       bool
+	authEditing    bool
+	authSchemes    []string
+	authSelected   int
+	authActiveName string
+	authMode       authMode
+	authToken      string
+	authUsername   string
+	authPassword   string
+	authScope      string
+	authError      string
+	authStore      map[string]authState
+
 	suspendEditorFile string
 
 	lastReq  httpclient.RequestSpec
@@ -88,11 +119,38 @@ type App struct {
 }
 
 func NewApp(in io.Reader, out io.Writer) *App {
-	return &App{in: in, out: out, scr: screenBaseURL}
+	return &App{in: in, out: out, scr: screenBaseURL, authStore: map[string]authState{}}
 }
 
 // singleLineEditor is an editor that doesn't consume Enter (lets keybinding handle it)
 type singleLineEditor struct{}
+
+// passwordEditor masks typed characters but stores real buffer.
+// It relies on the view buffer already containing the real value.
+// (gocui doesn't support masked inputs natively; this is good-enough for now.)
+type passwordEditor struct{}
+
+func (e passwordEditor) Edit(v *gocui.View, key gocui.Key, ch rune, mod gocui.Modifier) {
+	switch {
+	case key == gocui.KeyBackspace || key == gocui.KeyBackspace2:
+		v.EditDelete(true)
+	case key == gocui.KeyDelete:
+		v.EditDelete(false)
+	case key == gocui.KeyArrowLeft:
+		v.MoveCursor(-1, 0, false)
+	case key == gocui.KeyArrowRight:
+		v.MoveCursor(1, 0, false)
+	case key == gocui.KeyHome || key == gocui.KeyCtrlA:
+		v.SetCursor(0, 0)
+	case key == gocui.KeyEnd || key == gocui.KeyCtrlE:
+		line := v.Buffer()
+		v.SetCursor(len(line)-1, 0)
+	case key == gocui.KeyEnter:
+		// don't handle - let keybinding process it
+	case ch != 0 && mod == 0:
+		v.EditWrite(ch)
+	}
+}
 
 func (e singleLineEditor) Edit(v *gocui.View, key gocui.Key, ch rune, mod gocui.Modifier) {
 	switch {
@@ -201,6 +259,10 @@ func (a *App) layout(g *gocui.Gui) error {
 	}
 	a.renderFooter()
 
+	if a.authOpen {
+		return a.layoutAuth(maxX, maxY)
+	}
+
 	switch a.scr {
 	case screenBaseURL:
 		return a.layoutBaseURL(maxX, maxY)
@@ -213,6 +275,66 @@ func (a *App) layout(g *gocui.Gui) error {
 	default:
 		return nil
 	}
+}
+
+func (a *App) layoutAuth(maxX, maxY int) error {
+	// Centered auth modal
+	width := maxX - 10
+	if width > 100 {
+		width = 100
+	}
+	height := 14
+	if height > maxY-4 {
+		height = maxY - 4
+	}
+	x0 := (maxX - width) / 2
+	y0 := (maxY - height) / 2
+	x1 := x0 + width
+	y1 := y0 + height
+
+	// keep underlying views, but ensure auth views exist and are on top
+	if v, err := a.g.SetView("auth-box", x0, y0, x1, y1); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Authentication"
+	}
+	if v, err := a.g.SetView("auth-schemes", x0+1, y0+2, x0+28, y1-2); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Schemes"
+		v.Highlight = true
+		v.SelFgColor = gocui.ColorBlack
+		v.SelBgColor = gocui.ColorGreen
+		v.Autoscroll = false
+	}
+	if v, err := a.g.SetView("auth-form", x0+28, y0+2, x1-2, y1-2); err != nil {
+		if err != gocui.ErrUnknownView {
+			return err
+		}
+		v.Title = "Details"
+		v.Editable = false
+		v.Editor = singleLineEditor{}
+	}
+
+	// render
+	a.renderAuth()
+
+	// focus
+	if a.authEditing {
+		if _, err := a.g.SetCurrentView("auth-form"); err != nil {
+			return err
+		}
+	} else {
+		if _, err := a.g.SetCurrentView("auth-schemes"); err != nil {
+			return err
+		}
+	}
+	_, _ = a.g.SetViewOnTop("auth-form")
+	_, _ = a.g.SetViewOnTop("auth-schemes")
+	_, _ = a.g.SetViewOnTop("auth-box")
+	return nil
 }
 
 func (a *App) layoutBaseURL(maxX, maxY int) error {
@@ -441,6 +563,10 @@ func (a *App) bindKeys() error {
 	if err := g.SetKeybinding("", gocui.KeyEsc, gocui.ModNone, a.back); err != nil {
 		return err
 	}
+	// Global auth dialog hotkey (Shift+A)
+	if err := g.SetKeybinding("", 'A', gocui.ModNone, a.openAuth); err != nil {
+		return err
+	}
 
 	// base url (handled by the prompt's custom Editor)
 
@@ -556,12 +682,48 @@ func (a *App) bindKeys() error {
 		return err
 	}
 
+	// auth modal keys
+	if err := g.SetKeybinding("auth-schemes", gocui.KeyArrowDown, gocui.ModNone, a.moveAuthSel(1)); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-schemes", gocui.KeyArrowUp, gocui.ModNone, a.moveAuthSel(-1)); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-schemes", gocui.KeyEnter, gocui.ModNone, a.startAuthEdit); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-form", gocui.KeyEnter, gocui.ModNone, a.submitAuth); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-form", 'd', gocui.ModNone, a.clearAuth); err != nil {
+		return err
+	}
+	// printable input in auth form
+	for r := rune(32); r <= rune(126); r++ {
+		if err := g.SetKeybinding("auth-form", r, gocui.ModNone, a.authTypeRune(r)); err != nil {
+			return err
+		}
+	}
+	if err := g.SetKeybinding("auth-form", gocui.KeyBackspace, gocui.ModNone, a.authBackspace); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-form", gocui.KeyBackspace2, gocui.ModNone, a.authBackspace); err != nil {
+		return err
+	}
+	if err := g.SetKeybinding("auth-form", gocui.KeyTab, gocui.ModNone, a.authNextField); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 func (a *App) quit(*gocui.Gui, *gocui.View) error { return gocui.ErrQuit }
 
 func (a *App) back(*gocui.Gui, *gocui.View) error {
+	if a.authOpen {
+		a.closeAuth()
+		return nil
+	}
 	if a.editing {
 		return a.closeEdit()
 	}
@@ -575,6 +737,309 @@ func (a *App) back(*gocui.Gui, *gocui.View) error {
 	}
 	a.errorMsg = ""
 	return nil
+}
+
+func (a *App) openAuth(*gocui.Gui, *gocui.View) error {
+	// Only usable after OpenAPI has been loaded (we need schemes).
+	if len(a.secSchemes) == 0 {
+		a.errorMsg = "no security schemes found (load OpenAPI first)"
+		return nil
+	}
+
+	a.authOpen = true
+	a.authEditing = false
+	a.authError = ""
+	a.authSelected = 0
+	a.authMode = authModeToken
+
+	a.authSchemes = a.authSchemes[:0]
+	for name := range a.secSchemes {
+		a.authSchemes = append(a.authSchemes, name)
+	}
+	sort.Strings(a.authSchemes)
+
+	// preselect first
+	if len(a.authSchemes) > 0 {
+		a.authActiveName = a.authSchemes[a.authSelected]
+		a.loadAuthFormFromStore()
+	}
+	return nil
+}
+
+func (a *App) closeAuth() {
+	a.authOpen = false
+	a.authEditing = false
+	a.authError = ""
+	a.authMode = authModeToken
+	a.authActiveName = ""
+	if a.g != nil {
+		if v, err := a.g.View("auth-form"); err == nil {
+			v.Clear()
+			a.g.DeleteView("auth-form")
+		}
+		if v, err := a.g.View("auth-schemes"); err == nil {
+			v.Clear()
+			a.g.DeleteView("auth-schemes")
+		}
+		if v, err := a.g.View("auth-box"); err == nil {
+			v.Clear()
+			a.g.DeleteView("auth-box")
+		}
+	}
+}
+
+func (a *App) moveAuthSel(delta int) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		_ = g
+		_ = v
+		if !a.authOpen || a.authEditing || len(a.authSchemes) == 0 {
+			return nil
+		}
+		a.authSelected += delta
+		if a.authSelected < 0 {
+			a.authSelected = 0
+		}
+		if a.authSelected >= len(a.authSchemes) {
+			a.authSelected = len(a.authSchemes) - 1
+		}
+		a.authActiveName = a.authSchemes[a.authSelected]
+		a.authError = ""
+		a.loadAuthFormFromStore()
+		if sv, err := a.g.View("auth-schemes"); err == nil {
+			sv.SetCursor(0, a.authSelected)
+		}
+		return nil
+	}
+}
+
+func (a *App) startAuthEdit(*gocui.Gui, *gocui.View) error {
+	if !a.authOpen || len(a.authSchemes) == 0 {
+		return nil
+	}
+	a.authEditing = true
+	a.authError = ""
+	a.authMode = authModeToken
+	if scheme := a.secSchemes[a.authActiveName]; scheme.Type == "oauth2" && scheme.TokenURL != "" {
+		a.authMode = authModeUser
+	}
+	return nil
+}
+
+func (a *App) authTypeRune(r rune) func(*gocui.Gui, *gocui.View) error {
+	return func(g *gocui.Gui, v *gocui.View) error {
+		_ = g
+		_ = v
+		if !a.authOpen || !a.authEditing {
+			return nil
+		}
+		switch a.authMode {
+		case authModeToken:
+			a.authToken += string(r)
+		case authModeUser:
+			a.authUsername += string(r)
+		case authModePass:
+			a.authPassword += string(r)
+		case authModeScope:
+			a.authScope += string(r)
+		}
+		return nil
+	}
+}
+
+func (a *App) authBackspace(*gocui.Gui, *gocui.View) error {
+	if !a.authOpen || !a.authEditing {
+		return nil
+	}
+	switch a.authMode {
+	case authModeToken:
+		if len(a.authToken) > 0 {
+			a.authToken = a.authToken[:len(a.authToken)-1]
+		}
+	case authModeUser:
+		if len(a.authUsername) > 0 {
+			a.authUsername = a.authUsername[:len(a.authUsername)-1]
+		}
+	case authModePass:
+		if len(a.authPassword) > 0 {
+			a.authPassword = a.authPassword[:len(a.authPassword)-1]
+		}
+	case authModeScope:
+		if len(a.authScope) > 0 {
+			a.authScope = a.authScope[:len(a.authScope)-1]
+		}
+	}
+	return nil
+}
+
+func (a *App) authNextField(*gocui.Gui, *gocui.View) error {
+	if !a.authOpen || !a.authEditing {
+		return nil
+	}
+	// token-only mode stays on token
+	scheme := a.secSchemes[a.authActiveName]
+	if scheme.Type != "oauth2" || scheme.TokenURL == "" {
+		a.authMode = authModeToken
+		return nil
+	}
+
+	switch a.authMode {
+	case authModeUser:
+		a.authMode = authModePass
+	case authModePass:
+		a.authMode = authModeScope
+	case authModeScope:
+		a.authMode = authModeUser
+	default:
+		a.authMode = authModeUser
+	}
+	return nil
+}
+
+func (a *App) clearAuth(*gocui.Gui, *gocui.View) error {
+	if !a.authOpen {
+		return nil
+	}
+	name := a.authActiveName
+	delete(a.authStore, name)
+	a.authToken = ""
+	a.authUsername = ""
+	a.authPassword = ""
+	a.authScope = ""
+	a.authError = ""
+	a.authEditing = false
+	return nil
+}
+
+func (a *App) submitAuth(*gocui.Gui, *gocui.View) error {
+	if !a.authOpen {
+		return nil
+	}
+	name := a.authActiveName
+	ss, ok := a.secSchemes[name]
+	if !ok {
+		return nil
+	}
+	// Bearer token manual entry
+	if ss.Type == "http" && strings.EqualFold(ss.Scheme, "bearer") {
+		tok := strings.TrimSpace(a.authToken)
+		if tok == "" {
+			auth := authState{}
+			_ = auth
+			delete(a.authStore, name)
+			a.authEditing = false
+			return nil
+		}
+		a.authStore[name] = authState{schemeName: name, tokenType: "Bearer", token: tok, acquiredAt: time.Now()}
+		a.authEditing = false
+		a.authError = ""
+		return nil
+	}
+
+	// OAuth2 password flow
+	if ss.Type == "oauth2" && ss.TokenURL != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		accessToken, tokenType, err := httpclient.FetchOAuthPasswordToken(ctx, a.baseURL, ss.TokenURL, a.authUsername, a.authPassword, a.authScope)
+		if err != nil {
+			a.authError = err.Error()
+			return nil
+		}
+		if tokenType == "" {
+			tokenType = "Bearer"
+		}
+		a.authStore[name] = authState{schemeName: name, tokenType: tokenType, token: accessToken, acquiredAt: time.Now()}
+		a.authEditing = false
+		a.authError = ""
+		return nil
+	}
+
+	a.authError = "unsupported security scheme"
+	return nil
+}
+
+func (a *App) loadAuthFormFromStore() {
+	name := a.authActiveName
+	ss, ok := a.secSchemes[name]
+	if !ok {
+		return
+	}
+	if st, ok := a.authStore[name]; ok {
+		a.authToken = st.token
+		_ = ss
+	} else {
+		a.authToken = ""
+	}
+	// keep username/pass empty by default
+	if ss.Type != "oauth2" {
+		a.authUsername = ""
+		a.authPassword = ""
+		a.authScope = ""
+	}
+}
+
+func (a *App) renderAuth() {
+	// schemes list
+	if v, err := a.g.View("auth-schemes"); err == nil {
+		v.Clear()
+		for i, name := range a.authSchemes {
+			ss := a.secSchemes[name]
+			status := colorDim + "unset" + colorReset
+			if _, ok := a.authStore[name]; ok {
+				status = colorGreen + "set" + colorReset
+			}
+			desc := strings.TrimSpace(ss.Description)
+			if desc != "" {
+				desc = " - " + desc
+			}
+			fmt.Fprintf(v, "%s %s%s\n", status, name, desc)
+			if i == a.authSelected {
+				v.SetCursor(0, a.authSelected)
+			}
+		}
+	}
+
+	// form
+	if v, err := a.g.View("auth-form"); err == nil {
+		v.Clear()
+		name := a.authActiveName
+		ss := a.secSchemes[name]
+		if a.authError != "" {
+			fmt.Fprintf(v, "%serror:%s %s\n\n", colorRed, colorReset, a.authError)
+		}
+
+		if ss.Type == "http" && strings.EqualFold(ss.Scheme, "bearer") {
+			fmt.Fprintf(v, "Bearer token:\n")
+			fmt.Fprintf(v, "%s\n\n", a.authToken)
+			fmt.Fprintf(v, "%senter%s: save   %stab%s: (n/a)   %sd%s: clear   %sesc%s: close\n", colorDim, colorReset, colorDim, colorReset, colorDim, colorReset, colorDim, colorReset)
+			return
+		}
+
+		if ss.Type == "oauth2" && ss.TokenURL != "" {
+			fmt.Fprintf(v, "OAuth2 password flow\n")
+			fmt.Fprintf(v, "tokenUrl: %s\n\n", ss.TokenURL)
+			fmt.Fprintf(v, "username: %s%s%s\n", fieldMarker(a.authMode == authModeUser), a.authUsername, colorReset)
+			fmt.Fprintf(v, "password: %s%s%s\n", fieldMarker(a.authMode == authModePass), mask(a.authPassword), colorReset)
+			fmt.Fprintf(v, "scope:    %s%s%s\n\n", fieldMarker(a.authMode == authModeScope), a.authScope, colorReset)
+			fmt.Fprintf(v, "%stab%s: next field   %senter%s: fetch token   %sd%s: clear   %sesc%s: close\n", colorDim, colorReset, colorDim, colorReset, colorDim, colorReset, colorDim, colorReset)
+			return
+		}
+
+		fmt.Fprintf(v, "(unsupported scheme in MVP)\n")
+	}
+}
+
+func fieldMarker(active bool) string {
+	if active {
+		return colorCyan
+	}
+	return colorDim
+}
+
+func mask(s string) string {
+	if s == "" {
+		return ""
+	}
+	return strings.Repeat("*", len(s))
 }
 
 func (a *App) submitBaseURL(g *gocui.Gui, v *gocui.View) error {
@@ -610,6 +1075,7 @@ func (a *App) loadEndpoints() error {
 		return err
 	}
 	a.endpoints = openapi.ExtractEndpoints(doc)
+	a.secSchemes = openapi.ExtractSecuritySchemes(doc)
 	a.filter = ""
 	a.selected = 0
 	a.recomputeFilter()
@@ -1003,6 +1469,33 @@ func coerceJSONScalar(t model.ParamType, raw string) any {
 	return raw
 }
 
+func (a *App) authHeadersForEndpoint(ep model.Endpoint) map[string]string {
+	// No security requirements: nothing to inject.
+	if len(ep.Security) == 0 {
+		return nil
+	}
+
+	// Swagger semantics: SecurityRequirements is OR-of-requirements.
+	// Pick the first requirement that is fully satisfied by our authStore.
+	for _, req := range ep.Security {
+		ok := true
+		headers := map[string]string{}
+		for schemeName := range req {
+			st, has := a.authStore[schemeName]
+			if !has || strings.TrimSpace(st.token) == "" {
+				ok = false
+				break
+			}
+			// MVP: only Bearer-ish schemes -> Authorization header.
+			headers["Authorization"] = strings.TrimSpace(st.tokenType) + " " + strings.TrimSpace(st.token)
+		}
+		if ok {
+			return headers
+		}
+	}
+	return nil
+}
+
 func (a *App) beginEdit(viewName string) func(*gocui.Gui, *gocui.View) error {
 	return func(g *gocui.Gui, v *gocui.View) error {
 		if a.scr != screenBuilder || a.editing {
@@ -1101,10 +1594,19 @@ func (a *App) executeRequest(*gocui.Gui, *gocui.View) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
+	headers := a.authHeadersForEndpoint(a.activeEndpoint)
 	req, err := httpclient.BuildRequest(a.baseURL, a.activeEndpoint, a.pathVals, a.queryVals, a.bodyVals, a.bodyRaw)
 	if err != nil {
 		a.errorMsg = err.Error()
 		return nil
+	}
+	if len(headers) > 0 {
+		if req.Headers == nil {
+			req.Headers = map[string]string{}
+		}
+		for k, v := range headers {
+			req.Headers[k] = v
+		}
 	}
 	res, err := httpclient.Execute(ctx, req)
 	if err != nil {
@@ -1162,15 +1664,18 @@ func (a *App) renderFooter() {
 			switch a.scr {
 			case screenBaseURL:
 				msg = "enter: load openapi   q: quit"
+				if len(a.secSchemes) > 0 {
+					msg = "enter: load openapi   A: auth   q: quit"
+				}
 			case screenEndpoints:
-				msg = "type: filter   1-5: quick select   enter: select   esc: back   q: quit"
+				msg = "type: filter   1-5: quick select   enter: select   esc: back   A: auth   q: quit"
 			case screenBuilder:
-				msg = "tab: switch pane   enter: edit   d: reset param   ctrl+r: run   esc: back"
+				msg = "tab: switch pane   enter: edit   d: reset param   ctrl+r: run   A: auth   esc: back"
 				if a.pane == paneBody && a.activeEndpoint.Body != nil {
-					msg = "tab: switch pane   enter: edit json ($EDITOR)   d: reset param   ctrl+r: run   esc: back"
+					msg = "tab: switch pane   enter: edit json ($EDITOR)   d: reset param   ctrl+r: run   A: auth   esc: back"
 				}
 			case screenResponse:
-				msg = "up/down: scroll   r: rerun   enter: back to endpoints   esc: back"
+				msg = "up/down: scroll   r: rerun   enter: back to endpoints   A: auth   esc: back"
 			}
 		}
 		fmt.Fprint(v, msg)
@@ -1293,6 +1798,13 @@ func (a *App) renderBuilder() {
 		fmt.Fprintf(v, "%s  %s%s\n", colorizeMethod(a.activeEndpoint.Method), highlightPathParams(a.activeEndpoint.Path), label)
 		if strings.TrimSpace(a.bodyRaw) != "" {
 			fmt.Fprintf(v, "%sbody: raw json set%s\n", colorCyan, colorReset)
+		}
+		if len(a.activeEndpoint.Security) > 0 {
+			if a.authHeadersForEndpoint(a.activeEndpoint) != nil {
+				fmt.Fprintf(v, "%sauth: set%s\n", colorCyan, colorReset)
+			} else {
+				fmt.Fprintf(v, "%sauth: required (press A)%s\n", colorYellow, colorReset)
+			}
 		}
 	}
 

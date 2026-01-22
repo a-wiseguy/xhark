@@ -119,6 +119,7 @@ func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 				Path:        path,
 				Summary:     strings.TrimSpace(op.Summary),
 				OperationID: strings.TrimSpace(op.OperationID),
+				Security:    effectiveSecurity(op.Security, doc.Security),
 			}
 
 			params := append(openapi3.Parameters{}, commonParams...)
@@ -159,6 +160,67 @@ func ExtractEndpoints(doc *openapi3.T) []model.Endpoint {
 		addOp("delete", item.Delete)
 	}
 
+	return out
+}
+
+func effectiveSecurity(opSec *openapi3.SecurityRequirements, global openapi3.SecurityRequirements) []model.SecurityRequirement {
+	// Per spec: operation.security (when present) overrides top-level.
+	if opSec != nil {
+		return convertSecurityRequirements(*opSec)
+	}
+	if len(global) == 0 {
+		return nil
+	}
+	return convertSecurityRequirements(global)
+}
+
+func convertSecurityRequirements(in openapi3.SecurityRequirements) []model.SecurityRequirement {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]model.SecurityRequirement, 0, len(in))
+	for _, r := range in {
+		mr := model.SecurityRequirement{}
+		for name, scopes := range r {
+			cp := make([]string, len(scopes))
+			copy(cp, scopes)
+			mr[name] = cp
+		}
+		out = append(out, mr)
+	}
+	return out
+}
+
+func ExtractSecuritySchemes(doc *openapi3.T) map[string]model.SecurityScheme {
+	out := map[string]model.SecurityScheme{}
+	if doc == nil || doc.Components == nil {
+		return out
+	}
+
+	for name, ref := range doc.Components.SecuritySchemes {
+		if ref == nil || ref.Value == nil {
+			continue
+		}
+		ss := ref.Value
+		ms := model.SecurityScheme{
+			Name:         name,
+			Type:         strings.TrimSpace(ss.Type),
+			Description:  strings.TrimSpace(ss.Description),
+			Scheme:       strings.TrimSpace(ss.Scheme),
+			BearerFormat: strings.TrimSpace(ss.BearerFormat),
+		}
+		if ss.Flows != nil && ss.Flows.Password != nil {
+			ms.TokenURL = strings.TrimSpace(ss.Flows.Password.TokenURL)
+			// copy scopes to avoid sharing the backing map
+			if ss.Flows.Password.Scopes != nil {
+				ms.Scopes = map[string]string{}
+				for k, v := range ss.Flows.Password.Scopes {
+					ms.Scopes[k] = v
+				}
+			}
+		}
+		out[name] = ms
+	}
 	return out
 }
 

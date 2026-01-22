@@ -41,6 +41,22 @@ type BodySchema struct {
 	Fields    []BodyField
 }
 
+type SecurityScheme struct {
+	Name        string
+	Type        string // http, oauth2, apiKey, openIdConnect
+	Description string
+
+	// http
+	Scheme       string // bearer, basic, etc.
+	BearerFormat string
+
+	// oauth2 password flow (MVP)
+	TokenURL string
+	Scopes   map[string]string
+}
+
+type SecurityRequirement map[string][]string // schemeName -> required scopes
+
 type Endpoint struct {
 	Method      string
 	Path        string
@@ -50,4 +66,8 @@ type Endpoint struct {
 	PathParams  []Param
 	QueryParams []Param
 	Body        *BodySchema
+
+	// Security are the effective security requirements for this operation.
+	// If empty, the endpoint may still inherit global security.
+	Security []SecurityRequirement
 }

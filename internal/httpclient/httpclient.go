@@ -218,6 +218,71 @@ func epDefaultHeaders(ep model.Endpoint, bodyVals map[string]string) map[string]
 	return h
 }
 
+type oauthPasswordTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+}
+
+func FetchOAuthPasswordToken(ctx context.Context, baseURL string, tokenURL string, username string, password string, scope string) (accessToken string, tokenType string, err error) {
+	// tokenURL can be absolute or relative (FastAPI commonly uses "/token").
+	full := tokenURL
+	if u, perr := url.Parse(tokenURL); perr == nil && !u.IsAbs() {
+		base, berr := url.Parse(strings.TrimRight(baseURL, "/") + "/")
+		if berr == nil {
+			full = base.ResolveReference(u).String()
+		}
+	}
+
+	form := url.Values{}
+	form.Set("grant_type", "password")
+	form.Set("username", username)
+	form.Set("password", password)
+	if strings.TrimSpace(scope) != "" {
+		form.Set("scope", strings.TrimSpace(scope))
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, full, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	client := &http.Client{Timeout: defaultTimeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", "", fmt.Errorf("token request failed: %s", resp.Status)
+	}
+
+	var tr oauthPasswordTokenResponse
+	if err := json.Unmarshal(b, &tr); err != nil {
+		return "", "", fmt.Errorf("token response not json: %w", err)
+	}
+	if strings.TrimSpace(tr.AccessToken) == "" {
+		return "", "", fmt.Errorf("token response missing access_token")
+	}
+
+	tt := strings.TrimSpace(tr.TokenType)
+	if tt == "" {
+		tt = "Bearer"
+	} else {
+		// Normalize common values for header.
+		low := strings.ToLower(tt)
+		if low == "bearer" {
+			tt = "Bearer"
+		} else {
+			tt = tt
+		}
+	}
+	return tr.AccessToken, tt, nil
+}
+
 func formatBody(contentType string, body []byte) string {
 	ct := strings.ToLower(contentType)
 	if strings.Contains(ct, "application/json") {
