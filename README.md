@@ -4,7 +4,7 @@ A tiny OpenAPI client for your terminal: browse endpoints, build requests, run t
 
 - OpenAPI-driven endpoint browser with fuzzy filter
 - Request builder (path + query params)
-- JSON body editing via your `$EDITOR`
+- JSON body editing via your `$XHARK_EDITOR` / `$EDITOR`
 - Built-in auth helper: paste Bearer token, or fetch via OAuth2 password flow when declared in the spec
 
 ## Quickstart
