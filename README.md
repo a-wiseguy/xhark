@@ -2,6 +2,11 @@
 
 A tiny OpenAPI client for your terminal: browse endpoints, build requests, run them, and inspect responses in a fast TUI.
 
+![Screenshot: fuzzy search](./docs/screenshots/fuzzy-search.png)
+![Screenshot: parameter selection](./docs/screenshots/param-select.png)
+![Screenshot: JWT auth](./docs/screenshots/jwt-auth.png)
+![Screenshot: responses](./docs/screenshots/responses.png)
+
 - OpenAPI-driven endpoint browser with fuzzy filter
 - Request builder (path + query params)
 - JSON body editing via your `$XHARK_EDITOR` / `$EDITOR`
